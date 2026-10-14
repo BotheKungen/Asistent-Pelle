@@ -11,6 +11,8 @@ Flöde:
 Miljövariabler:
   DISCORD_TOKEN  (obligatorisk)  Bottens token
   PORT           (valfri)        Port för hälsokontroll-servern (standard 10000)
+  UPLOAD_CHANNEL_ID (valfri)     Kanal där boten själv ser till att knappen alltid finns
+                                 (ingen /setup behövs då)
 
 Kräver: discord.py >= 2.4
 """
@@ -33,6 +35,7 @@ UPLOAD_TIMEOUT_SECONDS = 120
 # Används bara om forumet inte har några taggar eller inte kan hämtas
 FALLBACK_CATEGORIES = ["Bilar", "Bildelar", "Karaktärer", "Övrigt"]
 EMBED_COLOR = discord.Color.from_rgb(88, 101, 242)
+PANEL_TITLE = "📤 Dela dina 3D-projektfiler"
 
 log = logging.getLogger("filbot")
 
@@ -290,6 +293,48 @@ class UploadView(discord.ui.View):
 
 
 # --------------------------------------------------------------------------- #
+# Uppladdningspanel (embed + knapp)
+# --------------------------------------------------------------------------- #
+def build_panel_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title=PANEL_TITLE,
+        description=(
+            "Klicka på knappen nedan för att ladda upp en fil "
+            "(.blend, .fbx, .obj m.fl.) till forumet.\n\n"
+            "**Så här gör du:**\n"
+            "1️⃣ Tryck på **Ladda upp fil**\n"
+            "2️⃣ Välj kategori i listan\n"
+            "3️⃣ Fyll i titel och beskrivning\n"
+            "4️⃣ Bifoga filen i chatten inom 2 minuter\n"
+            "5️⃣ Klart! Boten postar den i forumet åt dig ✨"
+        ),
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text="Kategorierna hämtas från forumets taggar")
+    return embed
+
+
+async def ensure_panel(bot: "FileBot", channel_id: int) -> None:
+    """Postar panelen i kanalen om den inte redan finns."""
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    if not isinstance(channel, discord.abc.Messageable):
+        log.warning("UPLOAD_CHANNEL_ID pekar inte på en textkanal.")
+        return
+
+    async for msg in channel.history(limit=100):
+        if (
+            msg.author.id == bot.user.id
+            and msg.embeds
+            and msg.embeds[0].title == PANEL_TITLE
+        ):
+            log.info("Uppladdningspanelen finns redan i kanalen.")
+            return
+
+    await channel.send(embed=build_panel_embed(), view=UploadView())
+    log.info("Uppladdningspanel postad i kanal %s.", channel_id)
+
+
+# --------------------------------------------------------------------------- #
 # Bot
 # --------------------------------------------------------------------------- #
 class FileBot(commands.Bot):
@@ -297,6 +342,7 @@ class FileBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True  # Krävs för !setup och för att läsa bilagor
         super().__init__(command_prefix="!", intents=intents)
+        self._panel_checked = False
 
     async def setup_hook(self) -> None:
         # Registrera den permanenta knappen så den fungerar efter omstart
@@ -306,6 +352,18 @@ class FileBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Inloggad som %s (ID: %s)", self.user, self.user.id)
+
+        # Kör bara första gången (on_ready kan triggas flera gånger)
+        if self._panel_checked:
+            return
+        self._panel_checked = True
+
+        raw = os.environ.get("UPLOAD_CHANNEL_ID")
+        if raw and raw.isdigit():
+            try:
+                await ensure_panel(self, int(raw))
+            except Exception:
+                log.exception("Kunde inte säkerställa uppladdningspanelen")
 
 
 class SetupCog(commands.Cog):
@@ -321,20 +379,7 @@ class SetupCog(commands.Cog):
     @commands.has_permissions(administrator=True)
     @app_commands.default_permissions(administrator=True)
     async def setup_laddaupp(self, ctx: commands.Context) -> None:
-        embed = discord.Embed(
-            title="📤 Dela dina 3D-projektfiler",
-            description=(
-                "Klicka på knappen nedan för att ladda upp en fil "
-                "(.blend, .fbx, .obj m.fl.) till forumet.\n\n"
-                "**Så här gör du:**\n"
-                "1️⃣ Tryck på **Ladda upp fil**\n"
-                "2️⃣ Fyll i titel, kategori och beskrivning\n"
-                "3️⃣ Bifoga filen i chatten inom 2 minuter\n"
-                "4️⃣ Klart! Boten postar den i forumet åt dig ✨"
-            ),
-            color=EMBED_COLOR,
-        )
-        embed.set_footer(text="Kategorier: Bilar • Bildelar • Karaktärer • Övrigt")
+        embed = build_panel_embed()
 
         await ctx.send(embed=embed, view=UploadView())
 
