@@ -22,11 +22,19 @@ Tips: skapa dessa taggar i forumet så får du statusen som riktiga taggar ocks�
   "Ny", "Behöver ändras", "Klar"   (finns de inte funkar allt ändå, men utan taggbyte)
 """
 
+import array
 import asyncio
+import io
+import json
 import logging
+import math
 import os
 import re
+import struct
+import sys
 import threading
+import zipfile
+import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -75,6 +83,16 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 COLOR_NEW = discord.Color.from_rgb(88, 101, 242)
 COLOR_CHANGES = discord.Color.from_rgb(250, 166, 26)
 COLOR_APPROVED = discord.Color.from_rgb(67, 181, 129)
+
+# Modellkoll: trianglar som är OK per kategori (matchas mot kategorinamnet, skiftlägesokänsligt)
+TRIANGLE_BUDGETS = {
+    "bilar": 60_000,
+    "bildelar": 15_000,
+    "karaktärer": 40_000,
+}
+DEFAULT_TRIANGLE_BUDGET = 50_000
+AUTO_SET_STATUS = True  # Sätt status "Behöver ändras" automatiskt vid allvarliga fel
+ANALYZE_MAX_BYTES = 80 * 1024 * 1024  # Större filer analyseras inte (skyddar minnet)
 
 PANEL_TITLE = "📤 Dela dina 3D-projektfiler"
 TODO_PANEL_TITLE = "📋 To-do"
@@ -241,6 +259,7 @@ class Collected:
     files: list[discord.File] = field(default_factory=list)
     preview_name: str | None = None
     link: str | None = None
+    data: bytes | None = None  # Filens bytes (bara för modellkoll)
 
 
 def add_file_fields(embed: discord.Embed, c: Collected) -> None:
@@ -336,6 +355,11 @@ async def collect_upload(interaction: discord.Interaction, link: str | None) -> 
     # Ladda ner filerna INNAN originalmeddelandet raderas
     collected = Collected(message=message, attachment=main)
     collected.files.append(await main.to_file())
+    if (
+        ext_of(main.filename) in (ANALYZABLE_EXTENSIONS | {".zip"})
+        and main.size <= ANALYZE_MAX_BYTES
+    ):
+        collected.data = collected.files[0].fp.getvalue()
     if preview is not None:
         preview_name = f"preview{ext_of(preview.filename) or '.png'}"
         collected.files.append(await preview.to_file(filename=preview_name))
@@ -470,6 +494,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         await safe_delete(c.message)
         await finish_prompt(interaction)
         bot.request_refresh()
+        schedule_model_check(bot, thread, c, user.id, category)
 
         tip = filename_tip(c.attachment.filename) if c.attachment else ""
         await interaction.followup.send(
@@ -584,6 +609,10 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
         await safe_delete(c.message)
         await finish_prompt(interaction)
         interaction.client.request_refresh()
+        category = ""
+        if starter_embed is not None:
+            category = next((f.value for f in starter_embed.fields if f.name == "📂 Kategori"), "")
+        schedule_model_check(interaction.client, thread, c, user.id, category)
 
         tip = filename_tip(c.attachment.filename) if c.attachment else ""
         await interaction.followup.send(
@@ -1292,6 +1321,626 @@ class HQCog(commands.Cog):
     @reminder_loop.before_loop
     async def _wait_until_ready(self) -> None:
         await self.bot.wait_until_ready()
+
+
+# --------------------------------------------------------------------------- #
+# Automatisk modellkoll (ren Python – ingen Blender behövs)
+# --------------------------------------------------------------------------- #
+class SkipAnalysis(Exception):
+    """Filen är inte en modell – gör ingen koll och säg ingenting."""
+
+
+class AnalysisError(Exception):
+    """Modellen kunde inte analyseras – meddelandet visas för användaren."""
+
+
+@dataclass
+class ModelStats:
+    fmt: str
+    triangles: int
+    vertices: int | None
+    materials: int | None
+    uv: str  # "ok" | "missing" | "partial" | "n/a"
+    size_m: tuple[float, float, float] | None
+    center_m: tuple[float, float, float] | None
+    units_known: bool
+    notes: list[str] = field(default_factory=list)
+
+
+def _bbox_result(mn, mx, scale: float = 1.0):
+    if mn[0] == math.inf:
+        return None, None
+    size = tuple((mx[i] - mn[i]) * scale for i in range(3))
+    center = tuple(((mx[i] + mn[i]) / 2) * scale for i in range(3))
+    return size, center
+
+
+# ---- glTF / GLB ----------------------------------------------------------- #
+def _mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def _identity():
+    return [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+
+
+def _node_matrix(node):
+    m = node.get("matrix")
+    if m and len(m) == 16:
+        return [[float(m[c * 4 + r]) for c in range(4)] for r in range(4)]
+    t = node.get("translation", [0, 0, 0])
+    x, y, z, w = node.get("rotation", [0, 0, 0, 1])
+    s = node.get("scale", [1, 1, 1])
+    r = [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+    return [
+        [r[0][0] * s[0], r[0][1] * s[1], r[0][2] * s[2], t[0]],
+        [r[1][0] * s[0], r[1][1] * s[1], r[1][2] * s[2], t[1]],
+        [r[2][0] * s[0], r[2][1] * s[1], r[2][2] * s[2], t[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _analyze_gltf(data: bytes, is_glb: bool) -> ModelStats:
+    try:
+        if is_glb:
+            if len(data) < 20 or data[:4] != b"glTF":
+                raise AnalysisError("Ogiltig GLB-fil.")
+            pos, doc = 12, None
+            while pos + 8 <= len(data):
+                chunk_len, chunk_type = struct.unpack_from("<II", data, pos)
+                if chunk_type == 0x4E4F534A:  # "JSON"
+                    doc = json.loads(data[pos + 8 : pos + 8 + chunk_len].decode("utf-8"))
+                    break
+                pos += 8 + chunk_len
+            if doc is None:
+                raise AnalysisError("Hittade ingen JSON-data i GLB-filen.")
+        else:
+            doc = json.loads(data.decode("utf-8-sig"))
+    except (ValueError, struct.error) as exc:
+        raise AnalysisError(f"Kunde inte läsa glTF-filen ({exc}).") from exc
+
+    accessors = doc.get("accessors", [])
+    meshes = doc.get("meshes", [])
+    nodes = doc.get("nodes", [])
+    cache: dict[int, list] = {}
+
+    def mesh_parts(idx: int) -> list:
+        if idx in cache:
+            return cache[idx]
+        parts = []
+        if 0 <= idx < len(meshes):
+            for prim in meshes[idx].get("primitives", []):
+                mode = prim.get("mode", 4)
+                attrs = prim.get("attributes", {})
+                if mode not in (4, 5, 6) or "POSITION" not in attrs:
+                    continue
+                pa = accessors[attrs["POSITION"]]
+                vcount = pa.get("count", 0)
+                if "indices" in prim:
+                    icount = accessors[prim["indices"]].get("count", 0)
+                else:
+                    icount = vcount
+                tris = icount // 3 if mode == 4 else max(icount - 2, 0)
+                bb = (pa["min"], pa["max"]) if pa.get("min") and pa.get("max") else None
+                parts.append((tris, vcount, bb, "TEXCOORD_0" in attrs, prim.get("material")))
+        cache[idx] = parts
+        return parts
+
+    instances: list[tuple[int, list]] = []
+
+    def walk(idx: int, parent, depth: int) -> None:
+        if depth > 64 or len(instances) > 20000 or not (0 <= idx < len(nodes)):
+            return
+        node = nodes[idx]
+        m = _mat_mul(parent, _node_matrix(node))
+        if "mesh" in node:
+            instances.append((node["mesh"], m))
+        for child in node.get("children", []):
+            walk(child, m, depth + 1)
+
+    scenes = doc.get("scenes")
+    if scenes:
+        scene_idx = doc.get("scene", 0)
+        scene = scenes[scene_idx if 0 <= scene_idx < len(scenes) else 0]
+        roots = scene.get("nodes", [])
+    else:
+        child_ids = {c for n in nodes for c in n.get("children", [])}
+        roots = [i for i in range(len(nodes)) if i not in child_ids]
+    for root in roots:
+        walk(root, _identity(), 0)
+    if not instances and not nodes:
+        instances = [(i, _identity()) for i in range(len(meshes))]
+
+    tris = verts = 0
+    materials: set[int] = set()
+    parts_total = parts_uv = 0
+    mn = [math.inf] * 3
+    mx = [-math.inf] * 3
+    for mesh_idx, m in instances:
+        for p_tris, p_verts, bb, has_uv, mat in mesh_parts(mesh_idx):
+            tris += p_tris
+            verts += p_verts
+            parts_total += 1
+            parts_uv += 1 if has_uv else 0
+            if mat is not None:
+                materials.add(mat)
+            if bb:
+                for cx in (bb[0][0], bb[1][0]):
+                    for cy in (bb[0][1], bb[1][1]):
+                        for cz in (bb[0][2], bb[1][2]):
+                            for i in range(3):
+                                v = m[i][0] * cx + m[i][1] * cy + m[i][2] * cz + m[i][3]
+                                mn[i] = min(mn[i], v)
+                                mx[i] = max(mx[i], v)
+
+    if parts_total == 0:
+        uv = "n/a"
+    elif parts_uv == parts_total:
+        uv = "ok"
+    elif parts_uv == 0:
+        uv = "missing"
+    else:
+        uv = "partial"
+
+    size, center = _bbox_result(mn, mx)
+    return ModelStats("glTF/GLB", tris, verts, len(materials), uv, size, center, units_known=True)
+
+
+# ---- OBJ ------------------------------------------------------------------ #
+def _analyze_obj(data: bytes) -> ModelStats:
+    verts = uvs = tris = 0
+    materials: set[str] = set()
+    mn = [math.inf] * 3
+    mx = [-math.inf] * 3
+    for line in data.decode("utf-8", errors="ignore").splitlines():
+        if line.startswith("v "):
+            parts = line.split()
+            try:
+                x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+            except (IndexError, ValueError):
+                continue
+            verts += 1
+            if x < mn[0]: mn[0] = x
+            if y < mn[1]: mn[1] = y
+            if z < mn[2]: mn[2] = z
+            if x > mx[0]: mx[0] = x
+            if y > mx[1]: mx[1] = y
+            if z > mx[2]: mx[2] = z
+        elif line.startswith("vt "):
+            uvs += 1
+        elif line.startswith("f "):
+            n = len(line.split()) - 1
+            if n >= 3:
+                tris += n - 2
+        elif line.startswith("usemtl "):
+            materials.add(line[7:].strip())
+    if verts == 0:
+        raise AnalysisError("Hittade inga vertices i OBJ-filen.")
+    size, center = _bbox_result(mn, mx)
+    return ModelStats(
+        "OBJ", tris, verts, len(materials), "ok" if uvs else "missing", size, center,
+        units_known=False,
+        notes=["OBJ saknar enhetsinfo – storleken antar 1 enhet = 1 meter."],
+    )
+
+
+# ---- STL ------------------------------------------------------------------ #
+def _analyze_stl(data: bytes) -> ModelStats:
+    mn = [math.inf] * 3
+    mx = [-math.inf] * 3
+    tris = 0
+    binary = False
+    if len(data) >= 84:
+        n = struct.unpack_from("<I", data, 80)[0]
+        binary = 84 + 50 * n == len(data)
+
+    if binary:
+        tris = n
+        for t in struct.iter_unpack("<12fH", data[84 : 84 + 50 * n]):
+            for off in (3, 6, 9):
+                x, y, z = t[off], t[off + 1], t[off + 2]
+                if x < mn[0]: mn[0] = x
+                if y < mn[1]: mn[1] = y
+                if z < mn[2]: mn[2] = z
+                if x > mx[0]: mx[0] = x
+                if y > mx[1]: mx[1] = y
+                if z > mx[2]: mx[2] = z
+    elif data.lstrip()[:5].lower() == b"solid":
+        count = 0
+        for line in data.decode("utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("vertex"):
+                parts = line.split()
+                try:
+                    x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+                except (IndexError, ValueError):
+                    continue
+                count += 1
+                if x < mn[0]: mn[0] = x
+                if y < mn[1]: mn[1] = y
+                if z < mn[2]: mn[2] = z
+                if x > mx[0]: mx[0] = x
+                if y > mx[1]: mx[1] = y
+                if z > mx[2]: mx[2] = z
+        tris = count // 3
+    else:
+        raise AnalysisError("Kunde inte tolka STL-filen.")
+
+    size, center = _bbox_result(mn, mx)
+    return ModelStats(
+        "STL", tris, None, None, "n/a", size, center, units_known=False,
+        notes=["STL saknar enhet och UV – storleken antar 1 enhet = 1 meter (CAD-filer är ofta i mm)."],
+    )
+
+
+# ---- FBX (binär) ----------------------------------------------------------- #
+_FBX_MAGIC = b"Kaydara FBX Binary  "
+_FBX_PROP_NODES = {"Vertices", "PolygonVertexIndex", "P", "Geometry"}
+
+
+def _fbx_read_array(data: bytes, pos: int, code: str):
+    _length, enc, comp_len = struct.unpack_from("<III", data, pos)
+    pos += 12
+    raw = data[pos : pos + comp_len]
+    if enc == 1:
+        raw = zlib.decompress(raw)
+    arr = array.array({"d": "d", "f": "f", "i": "i", "l": "q", "b": "b"}[code])
+    arr.frombytes(raw)
+    if sys.byteorder == "big":
+        arr.byteswap()
+    return arr, pos + comp_len
+
+
+def _fbx_props(data: bytes, pos: int, count: int) -> list:
+    props: list = []
+    for _ in range(count):
+        t = chr(data[pos])
+        pos += 1
+        if t == "Y":
+            props.append(struct.unpack_from("<h", data, pos)[0]); pos += 2
+        elif t == "C":
+            props.append(data[pos]); pos += 1
+        elif t == "I":
+            props.append(struct.unpack_from("<i", data, pos)[0]); pos += 4
+        elif t == "F":
+            props.append(struct.unpack_from("<f", data, pos)[0]); pos += 4
+        elif t == "D":
+            props.append(struct.unpack_from("<d", data, pos)[0]); pos += 8
+        elif t == "L":
+            props.append(struct.unpack_from("<q", data, pos)[0]); pos += 8
+        elif t in "fdilb":
+            arr, pos = _fbx_read_array(data, pos, t)
+            props.append(arr)
+        elif t in "SR":
+            n = struct.unpack_from("<I", data, pos)[0]
+            props.append(data[pos + 4 : pos + 4 + n].decode("utf-8", "ignore") if t == "S" else None)
+            pos += 4 + n
+        else:
+            raise AnalysisError("FBX-filen innehåller okänd data.")
+    return props
+
+
+def _fbx_nodes(data: bytes, pos: int, end: int, wide: bool, depth: int = 0) -> list:
+    nodes = []
+    hdr = 25 if wide else 13
+    fmt = "<QQQB" if wide else "<IIIB"
+    while pos + hdr <= end and depth < 32:
+        end_off, nprops, plen, nlen = struct.unpack_from(fmt, data, pos)
+        if end_off == 0:
+            break
+        name_start = pos + hdr
+        name = data[name_start : name_start + nlen].decode("ascii", "ignore")
+        props_start = name_start + nlen
+        children_start = props_start + plen
+        props = _fbx_props(data, props_start, nprops) if name in _FBX_PROP_NODES and nprops else []
+        children = _fbx_nodes(data, children_start, end_off, wide, depth + 1) if children_start < end_off else []
+        nodes.append((name, props, children))
+        pos = end_off
+    return nodes
+
+
+def _analyze_fbx(data: bytes) -> ModelStats:
+    if data[:5] == b"; FBX":
+        raise AnalysisError("ASCII-FBX stöds inte – exportera som binär FBX (standard i Blender).")
+    if data[:20] != _FBX_MAGIC or len(data) < 27:
+        raise AnalysisError("Ogiltig FBX-fil.")
+    version = struct.unpack_from("<I", data, 23)[0]
+    try:
+        top = _fbx_nodes(data, 27, len(data), wide=version >= 7500)
+    except (struct.error, zlib.error, ValueError) as exc:
+        raise AnalysisError(f"Kunde inte läsa FBX-filen ({exc}).") from exc
+
+    unit_factor = 1.0  # 1.0 = centimeter i FBX
+    for name, _props, children in top:
+        if name != "GlobalSettings":
+            continue
+        for n2, _p2, c2 in children:
+            if n2 == "Properties70":
+                for n3, p3, _c3 in c2:
+                    if n3 == "P" and len(p3) >= 5 and p3[0] == "UnitScaleFactor":
+                        unit_factor = float(p3[4])
+
+    tris = verts = materials = 0
+    geoms = geoms_uv = 0
+    mn = [math.inf] * 3
+    mx = [-math.inf] * 3
+    for name, _props, children in top:
+        if name != "Objects":
+            continue
+        for n2, p2, c2 in children:
+            if n2 == "Material":
+                materials += 1
+            elif n2 == "Geometry":
+                if len(p2) >= 3 and isinstance(p2[2], str) and p2[2] != "Mesh":
+                    continue
+                vertices = next((p[0] for nm, p, _ in c2 if nm == "Vertices" and p), None)
+                indices = next((p[0] for nm, p, _ in c2 if nm == "PolygonVertexIndex" and p), None)
+                if vertices is None or indices is None:
+                    continue
+                geoms += 1
+                if any(nm == "LayerElementUV" for nm, _, _ in c2):
+                    geoms_uv += 1
+                verts += len(vertices) // 3
+                n = 0
+                for idx in indices:
+                    n += 1
+                    if idx < 0:
+                        tris += max(n - 2, 0)
+                        n = 0
+                for axis in range(3):
+                    column = vertices[axis::3]
+                    if len(column):
+                        mn[axis] = min(mn[axis], min(column))
+                        mx[axis] = max(mx[axis], max(column))
+
+    if geoms == 0:
+        raise AnalysisError("Hittade ingen mesh i FBX-filen.")
+
+    if geoms_uv == geoms:
+        uv = "ok"
+    elif geoms_uv == 0:
+        uv = "missing"
+    else:
+        uv = "partial"
+
+    size, center = _bbox_result(mn, mx, scale=unit_factor / 100.0)
+    return ModelStats(
+        "FBX", tris, verts, materials, uv, size, center, units_known=True,
+        notes=["FBX-storleken är beräknad från filens enhetsinställning (ungefärlig)."],
+    )
+
+
+# ---- Gemensam ingång ------------------------------------------------------- #
+ANALYZABLE_EXTENSIONS = {".glb", ".gltf", ".obj", ".stl", ".fbx"}
+MODEL_CHECK_EXTENSIONS = ANALYZABLE_EXTENSIONS | {".zip", ".blend"}
+
+
+def analyze(data: bytes, filename: str) -> ModelStats:
+    ext = ext_of(filename)
+    if ext == ".glb":
+        return _analyze_gltf(data, True)
+    if ext == ".gltf":
+        return _analyze_gltf(data, False)
+    if ext == ".obj":
+        return _analyze_obj(data)
+    if ext == ".stl":
+        return _analyze_stl(data)
+    if ext == ".fbx":
+        return _analyze_fbx(data)
+    if ext == ".blend":
+        raise AnalysisError(
+            "`.blend`-filer kan inte analyseras automatiskt.\n"
+            "Exportera som **.fbx** eller **.glb** och ladda upp som ny version "
+            "(🔄-knappen) så får du en modellkoll."
+        )
+    if ext == ".zip":
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                candidates = [
+                    i for i in zf.infolist()
+                    if not i.is_dir()
+                    and ext_of(i.filename) in ANALYZABLE_EXTENSIONS
+                    and i.file_size <= ANALYZE_MAX_BYTES
+                ]
+                if not candidates:
+                    raise SkipAnalysis()
+                best = max(candidates, key=lambda i: i.file_size)
+                stats = analyze(zf.read(best), best.filename)
+        except zipfile.BadZipFile as exc:
+            raise AnalysisError("Kunde inte öppna zip-filen.") from exc
+        extra = f" ({len(candidates)} modellfiler hittades, den största analyserades)" if len(candidates) > 1 else ""
+        stats.notes.insert(0, f"Analyserade `{best.filename}` i zip-filen{extra}.")
+        return stats
+    raise SkipAnalysis()
+
+
+# ---- Rapport --------------------------------------------------------------- #
+def fmt_int(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def build_report(stats: ModelStats, filename: str, category: str) -> tuple[discord.Embed, bool]:
+    budget = TRIANGLE_BUDGETS.get(category.strip().casefold(), DEFAULT_TRIANGLE_BUDGET)
+    issues: list[tuple[str, str]] = []  # (nivå, text)
+
+    # Trianglar
+    if stats.triangles == 0:
+        tri_icon = "🔴"
+        issues.append(("hard", "Inga trianglar hittades – är filen tom?"))
+    elif stats.triangles > budget * 2:
+        tri_icon = "🔴"
+        issues.append((
+            "hard",
+            f"Väldigt många trianglar ({fmt_int(stats.triangles)}). Målet för **{category or 'den här kategorin'}** "
+            f"är ≈{fmt_int(budget)}. Använd Decimate-modifier eller retopologi.",
+        ))
+    elif stats.triangles > budget:
+        tri_icon = "⚠️"
+        issues.append((
+            "warn",
+            f"Lite tungt: {fmt_int(stats.triangles)} trianglar (mål ≈{fmt_int(budget)}).",
+        ))
+    else:
+        tri_icon = "✅"
+
+    # Skala och origin
+    size_text = "–"
+    origin_text = "–"
+    if stats.size_m is not None:
+        sx, sy, sz = stats.size_m
+        size_text = f"{sx:.2f} × {sy:.2f} × {sz:.2f} m"
+        biggest = max(stats.size_m)
+        level_small = "hard" if stats.units_known else "warn"
+        if biggest < 0.01:
+            issues.append((level_small, f"Modellen är extremt liten ({biggest * 100:.2f} cm). Troligen fel skala – kolla enheterna vid export (1 enhet = 1 m)."))
+        elif biggest > 200:
+            issues.append((level_small, f"Modellen är gigantisk ({biggest:.0f} m). Troligen fel skala – kolla enheterna vid export."))
+        elif biggest < 0.1:
+            issues.append(("warn", f"Väldigt liten modell ({biggest * 100:.1f} cm) – stämmer skalan?"))
+        elif biggest > 50:
+            issues.append(("warn", f"Mycket stor modell ({biggest:.0f} m) – stämmer skalan?"))
+
+        if stats.center_m is not None and biggest > 0:
+            offset = math.sqrt(sum(c * c for c in stats.center_m))
+            if offset > biggest:
+                origin_text = f"⚠️ {offset:.1f} m från modellen"
+                issues.append(("warn", f"Origin ligger {offset:.1f} m från modellen. Sätt origin till modellens mitt/botten innan export (Set Origin)."))
+            else:
+                origin_text = "✅ Rimlig"
+
+    # UV
+    uv_text = {"ok": "✅ Finns", "missing": "⚠️ Saknas", "partial": "⚠️ Delvis", "n/a": "–"}[stats.uv]
+    if stats.uv == "missing":
+        issues.append(("warn", "Saknar UV-kartor – texturer går inte att lägga på (okej om ni bara använder materialfärger)."))
+    elif stats.uv == "partial":
+        issues.append(("warn", "Vissa delar saknar UV-kartor."))
+
+    # Material
+    mat_text = "–"
+    if stats.materials is not None:
+        mat_text = str(stats.materials)
+        if stats.materials == 0:
+            mat_text = "⚠️ 0"
+            issues.append(("warn", "Inga material tilldelade – modellen blir rosa/grå i Unity."))
+        elif stats.materials > 8:
+            mat_text = f"⚠️ {stats.materials}"
+            issues.append(("warn", f"Många material ({stats.materials}) – varje material är ett extra draw call i Unity. Slå ihop om möjligt."))
+
+    hard = any(level == "hard" for level, _ in issues)
+    if hard:
+        color, headline = discord.Color.red(), "🔴 **Åtgärda innan Unity:**"
+    elif issues:
+        color, headline = COLOR_CHANGES, "🟡 **Fungerar, men kolla det här:**"
+    else:
+        color, headline = COLOR_APPROVED, "🟢 **Ser bra ut för Unity!** Inga problem hittades."
+
+    lines = [headline]
+    for level, text in issues:
+        lines.append(f"{'🔴' if level == 'hard' else '⚠️'} {text}")
+    for note in stats.notes:
+        lines.append(f"ℹ️ *{note}*")
+
+    embed = discord.Embed(
+        title=truncate(f"🔍 Modellkoll – {filename}", 256),
+        description=truncate("\n".join(lines), 4000),
+        color=color,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name="🔺 Trianglar", value=f"{tri_icon} {fmt_int(stats.triangles)}", inline=True)
+    embed.add_field(name="🔹 Vertices", value=fmt_int(stats.vertices) if stats.vertices is not None else "–", inline=True)
+    embed.add_field(name="🎨 Material", value=mat_text, inline=True)
+    embed.add_field(name="🗺️ UV", value=uv_text, inline=True)
+    embed.add_field(name="📏 Storlek", value=size_text, inline=True)
+    embed.add_field(name="🎯 Origin", value=origin_text, inline=True)
+    embed.set_footer(text=f"Automatisk analys ({stats.fmt}) – ersätter inte en titt i Unity")
+    return embed, hard
+
+
+# ---- Körning i bakgrunden --------------------------------------------------- #
+_BG_TASKS: set = set()
+
+
+async def mark_needs_changes(thread: discord.Thread) -> None:
+    starter = await thread.fetch_message(thread.id)
+    if starter.embeds:
+        embed = starter.embeds[0].copy()
+        set_field(embed, FIELD_STATUS, f"🛠️ {STATUS_CHANGES}")
+        embed.color = COLOR_CHANGES
+        await starter.edit(embed=embed)
+    await set_thread_status(thread, STATUS_CHANGES)
+
+
+async def run_model_check(
+    bot: "FileBot", thread: discord.Thread, filename: str, data: bytes | None,
+    category: str, uploader: int,
+) -> None:
+    ext = ext_of(filename)
+    try:
+        if data is None and ext != ".blend":
+            raise AnalysisError(
+                f"Filen är för stor för automatisk modellkoll (gräns {ANALYZE_MAX_BYTES // 1024 // 1024} MB)."
+            )
+        stats = await asyncio.to_thread(analyze, data or b"", filename)
+    except SkipAnalysis:
+        return
+    except AnalysisError as exc:
+        embed = discord.Embed(
+            title=truncate(f"🔍 Modellkoll – {filename}", 256),
+            description=str(exc),
+            color=discord.Color.light_grey(),
+        )
+        await thread.send(embed=embed)
+        return
+    except Exception:
+        log.exception("Modellkollen kraschade för %s", filename)
+        embed = discord.Embed(
+            title=truncate(f"🔍 Modellkoll – {filename}", 256),
+            description="Kunde inte analysera filen (okänt fel). Den är fortfarande uppladdad som vanligt.",
+            color=discord.Color.light_grey(),
+        )
+        await thread.send(embed=embed)
+        return
+
+    embed, hard = build_report(stats, filename, category)
+    mention = None
+    allowed = discord.AllowedMentions.none()
+    if hard:
+        if AUTO_SET_STATUS:
+            embed.description = truncate(
+                (embed.description or "") + f"\n\n🛠️ Status sattes automatiskt till **{STATUS_CHANGES}**.", 4000
+            )
+            try:
+                await mark_needs_changes(thread)
+            except discord.HTTPException:
+                log.exception("Kunde inte sätta status efter modellkoll")
+        mention = f"<@{uploader}>"
+        allowed = discord.AllowedMentions(users=[discord.Object(id=uploader)])
+
+    await thread.send(content=mention, embed=embed, allowed_mentions=allowed)
+    bot.request_refresh()
+
+
+async def _guarded_model_check(*args) -> None:
+    try:
+        await run_model_check(*args)
+    except Exception:
+        log.exception("Modellkollen misslyckades")
+
+
+def schedule_model_check(
+    bot: "FileBot", thread: discord.Thread, c: "Collected", uploader: int, category: str
+) -> None:
+    if c.attachment is None or ext_of(c.attachment.filename) not in MODEL_CHECK_EXTENSIONS:
+        return
+    task = asyncio.create_task(
+        _guarded_model_check(bot, thread, c.attachment.filename, c.data, category, uploader)
+    )
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 
 # --------------------------------------------------------------------------- #
