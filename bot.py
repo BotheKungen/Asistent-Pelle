@@ -32,6 +32,7 @@ from discord.ext import commands
 # --------------------------------------------------------------------------- #
 FORUM_CHANNEL_ID = 1559907105279053926
 UPLOAD_TIMEOUT_SECONDS = 120
+EPHEMERAL_LIFETIME = 300  # Dolda meddelanden raderas automatiskt efter 5 min
 # Används bara om forumet inte har några taggar eller inte kan hämtas
 FALLBACK_CATEGORIES = ["Bilar", "Bildelar", "Karaktärer", "Övrigt"]
 EMBED_COLOR = discord.Color.from_rgb(88, 101, 242)
@@ -111,6 +112,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
             f"**{UPLOAD_TIMEOUT_SECONDS // 60} minuter**.\n"
             f"Skicka bara filen som ett vanligt meddelande.",
             ephemeral=True,
+            delete_after=EPHEMERAL_LIFETIME,
         )
 
         channel = interaction.channel
@@ -131,6 +133,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
             await interaction.followup.send(
                 "⏰ Tiden gick ut – ingen fil bifogades. Klicka på knappen och försök igen.",
                 ephemeral=True,
+                delete_after=EPHEMERAL_LIFETIME,
             )
             return
 
@@ -146,6 +149,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
                 "❌ Något gick fel när filen skulle postas i forumet. "
                 "Kontrollera mina behörigheter och försök igen.",
                 ephemeral=True,
+                delete_after=EPHEMERAL_LIFETIME,
             )
 
     async def _publish(
@@ -166,6 +170,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
             await interaction.followup.send(
                 "❌ Kanalen med det angivna ID:t är inte en Forum-kanal.",
                 ephemeral=True,
+                delete_after=EPHEMERAL_LIFETIME,
             )
             return
 
@@ -210,19 +215,26 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         except (discord.Forbidden, discord.NotFound):
             log.warning("Kunde inte radera uppladdningsmeddelandet (saknar Manage Messages?)")
 
+        # Ta bort den gamla uppmaningen ("bifoga din fil ...") när allt gick bra
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+
         tag_info = f"\n🏷️ Kategori: **{category}**"
         await interaction.followup.send(
             f"✅ Din fil har laddats upp!{tag_info}\n{thread.jump_url}",
             ephemeral=True,
+            delete_after=EPHEMERAL_LIFETIME,
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         log.exception("Modal-fel", exc_info=error)
         msg = "❌ Ett oväntat fel inträffade."
         if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
+            await interaction.followup.send(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
         else:
-            await interaction.response.send_message(msg, ephemeral=True)
+            await interaction.response.send_message(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
 
 
 # --------------------------------------------------------------------------- #
@@ -261,7 +273,7 @@ class CategorySelect(discord.ui.Select):
 
 class CategoryView(discord.ui.View):
     def __init__(self, forum: discord.ForumChannel | None) -> None:
-        super().__init__(timeout=180)
+        super().__init__(timeout=EPHEMERAL_LIFETIME)
         self.add_item(CategorySelect(forum))
 
 
@@ -289,6 +301,7 @@ class UploadView(discord.ui.View):
             "📂 Välj vilken **kategori** din fil tillhör:",
             view=CategoryView(forum),
             ephemeral=True,
+            delete_after=EPHEMERAL_LIFETIME,
         )
 
 
