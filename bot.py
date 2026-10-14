@@ -12,9 +12,11 @@ Flöde:
 Miljövariabler:
   DISCORD_TOKEN      (obligatorisk)  Bottens token
   PORT               (valfri)        Port för hälsokontroll-servern (standard 10000)
-  UPLOAD_CHANNEL_ID  (valfri)        Kanal där boten själv ser till att panelen alltid finns
+  UPLOAD_CHANNEL_ID  (valfri)        Kanal där boten själv ser till att uppladdningspanelen finns
+  TODO_CHANNEL_ID    (valfri)        Kanal för to-do-listan (panel + uppgiftskort)
+  DASHBOARD_CHANNEL_ID (valfri)      Kanal där dashboarden visas och uppdateras automatiskt
 
-Kräver: discord.py >= 2.4
+Kräver: discord.py >= 2.4  (och gärna tzdata, för svensk tid på deadlines)
 
 Tips: skapa dessa taggar i forumet så får du statusen som riktiga taggar också:
   "Ny", "Behöver ändras", "Klar"   (finns de inte funkar allt ändå, men utan taggbyte)
@@ -26,11 +28,12 @@ import os
 import re
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # --------------------------------------------------------------------------- #
 # Konfiguration
@@ -50,13 +53,6 @@ STATUS_NEW = "Ny"
 STATUS_CHANGES = "Behöver ändras"
 STATUS_APPROVED = "Klar"
 ALL_STATUSES = (STATUS_NEW, STATUS_CHANGES, STATUS_APPROVED)
-
-# Emojis för slutet av trådens titel
-STATUS_EMOJIS = {
-    STATUS_NEW: "🕒",
-    STATUS_CHANGES: "🔴",
-    STATUS_APPROVED: "✅"
-}
 
 FIELD_STATUS = "📌 Status"
 FIELD_VERSION = "🔢 Version"
@@ -81,6 +77,21 @@ COLOR_CHANGES = discord.Color.from_rgb(250, 166, 26)
 COLOR_APPROVED = discord.Color.from_rgb(67, 181, 129)
 
 PANEL_TITLE = "📤 Dela dina 3D-projektfiler"
+TODO_PANEL_TITLE = "📋 To-do"
+DASHBOARD_TITLE = "🎮 Game HQ"
+
+QUICK_LIFETIME = 20  # Korta kvitton ("uppgiften skapad") raderas efter 20 sek
+
+FIELD_TASK_STATUS = "📋 Status"
+FIELD_ASSIGNEE = "👤 Ansvarig"
+FIELD_DEADLINE = "⏰ Deadline"
+
+try:
+    from zoneinfo import ZoneInfo
+
+    TZ = ZoneInfo("Europe/Stockholm")
+except Exception:  # tzdata saknas -> använd UTC
+    TZ = timezone.utc
 
 log = logging.getLogger("filbot")
 
@@ -116,6 +127,11 @@ def start_http_server() -> None:
 # --------------------------------------------------------------------------- #
 # Hjälpfunktioner
 # --------------------------------------------------------------------------- #
+def env_int(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() else None
+
+
 def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -169,12 +185,11 @@ def find_status_tag(forum: discord.ForumChannel, status: str) -> discord.ForumTa
 
 
 async def set_thread_status(thread: discord.Thread, status: str) -> None:
-    """Byter statustagg på tråden (behåller kategori-taggen) och uppdaterar titel-emojin."""
+    """Byter statustagg på tråden (behåller kategori-taggen)."""
     forum = thread.parent
     if not isinstance(forum, discord.ForumChannel):
         return
 
-    # Hantera taggar
     status_names = {s.casefold() for s in ALL_STATUSES}
     keep = [t for t in thread.applied_tags if t.name.strip().casefold() not in status_names]
     new_tag = find_status_tag(forum, status)
@@ -182,31 +197,9 @@ async def set_thread_status(thread: discord.Thread, status: str) -> None:
         keep.append(new_tag)
     keep = keep[:5]  # Discord tillåter max 5 taggar per tråd
 
-    # Hantera trådens namn (Titel-emoji)
-    current_name = thread.name
-    clean_name = current_name
-    for e in STATUS_EMOJIS.values():
-        if clean_name.endswith(e):
-            clean_name = clean_name[:-len(e)].strip()
-    
-    # Discord tillåter max 100 tecken, vi stannar vid 95 för säkerhets skull
-    new_name = f"{truncate(clean_name, 95)} {STATUS_EMOJIS[status]}"
-
-    # Skapa uppdateringen
-    edit_kwargs = {"archived": False}
-    if new_name != current_name:
-        edit_kwargs["name"] = new_name
-    
-    current_tag_ids = {t.id for t in thread.applied_tags}
-    new_tag_ids = {t.id for t in keep}
-    if current_tag_ids != new_tag_ids:
-        edit_kwargs["applied_tags"] = keep
-
-    if len(edit_kwargs) == 1 and "archived" in edit_kwargs:
-        if not thread.archived:
-            return  # Inget behöver ändras
-
-    await thread.edit(**edit_kwargs)
+    if new_tag is None and len(keep) == len(thread.applied_tags):
+        return  # Inget att ändra
+    await thread.edit(applied_tags=keep, archived=False)
 
 
 async def get_thread(interaction: discord.Interaction) -> discord.Thread | None:
@@ -464,12 +457,8 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         if c.files:
             kwargs["files"] = c.files
 
-        # Sätt trådens namn direkt med den första emojin (Klockan)
-        base_name = f"[{category}] {title}"
-        thread_name = f"{truncate(base_name, 95)} {STATUS_EMOJIS[STATUS_NEW]}"
-
         created = await forum.create_thread(
-            name=thread_name,
+            name=truncate(f"[{category}] {title}", 100),
             content="@everyone",
             embed=embed,
             view=ThreadView(),
@@ -480,6 +469,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
 
         await safe_delete(c.message)
         await finish_prompt(interaction)
+        bot.request_refresh()
 
         tip = filename_tip(c.attachment.filename) if c.attachment else ""
         await interaction.followup.send(
@@ -589,12 +579,11 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
             set_field(starter_embed, FIELD_STATUS, f"🆕 {STATUS_NEW}")
             starter_embed.color = COLOR_NEW
             await starter.edit(embed=starter_embed)
-            
-        # Den här funktionen byter nu både tagg OCH emojin i titeln!
         await set_thread_status(thread, STATUS_NEW)
 
         await safe_delete(c.message)
         await finish_prompt(interaction)
+        interaction.client.request_refresh()
 
         tip = filename_tip(c.attachment.filename) if c.attachment else ""
         await interaction.followup.send(
@@ -610,33 +599,6 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
             await interaction.followup.send(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
         else:
             await interaction.response.send_message(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
-
-
-# --------------------------------------------------------------------------- #
-# Modal: Behöver ändras
-# --------------------------------------------------------------------------- #
-class ChangesModal(discord.ui.Modal, title="Vad behöver ändras?"):
-    reason_input = discord.ui.TextInput(
-        label="Beskrivning av ändringar",
-        placeholder="T.ex. fixa texturerna, modellen är för stor...",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1500,
-    )
-
-    def __init__(self, view: "ThreadView") -> None:
-        super().__init__()
-        self.thread_view = view
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Skickar vidare texten till status-funktionen
-        await self.thread_view._change_status(
-            interaction, 
-            STATUS_CHANGES, 
-            "🛠️", 
-            COLOR_CHANGES, 
-            reason=self.reason_input.value
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -677,8 +639,7 @@ class ThreadView(discord.ui.View):
     async def changes_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        # Öppnar textformuläret
-        await interaction.response.send_modal(ChangesModal(self))
+        await self._change_status(interaction, STATUS_CHANGES, "🛠️", COLOR_CHANGES)
 
     async def _change_status(
         self,
@@ -686,50 +647,38 @@ class ThreadView(discord.ui.View):
         status: str,
         emoji: str,
         color: discord.Color,
-        reason: str | None = None
     ) -> None:
         message = interaction.message
         if message is None or not message.embeds:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ Hittar inget inlägg att uppdatera.",
-                    ephemeral=True,
-                    delete_after=EPHEMERAL_LIFETIME,
-                )
+            await interaction.response.send_message(
+                "❌ Hittar inget inlägg att uppdatera.",
+                ephemeral=True,
+                delete_after=EPHEMERAL_LIFETIME,
+            )
             return
 
         embed = message.embeds[0].copy()
         set_field(embed, FIELD_STATUS, f"{emoji} {status}")
         embed.color = color
-        
-        if interaction.response.is_done():
-            await interaction.followup.edit_message(message.id, embed=embed)
-        else:
-            await interaction.response.edit_message(embed=embed)
+        await interaction.response.edit_message(embed=embed)
+        interaction.client.request_refresh()
 
         thread = await get_thread(interaction)
         if thread is None:
             return
 
         try:
-            # Nu byter den tagg + emoji i namnet!
             await set_thread_status(thread, status)
         except discord.HTTPException:
-            log.exception("Kunde inte byta statustagg eller namn")
+            log.exception("Kunde inte byta statustagg")
 
         # Meddela i tråden och pinga uppladdaren (om det inte är hen själv)
         uid = uploader_id(embed)
         text = f"{emoji} **{status}** – satt av {interaction.user.mention}"
-        
-        # Om det finns en "behöver ändras"-kommentar
-        if reason:
-            text += f"\n📝 **Kommentar:** {reason}"
-
         mentions = discord.AllowedMentions.none()
         if uid and uid != interaction.user.id:
             text += f"\n<@{uid}>"
             mentions = discord.AllowedMentions(users=[discord.Object(id=uid)])
-            
         await thread.send(text, allowed_mentions=mentions)
 
 
@@ -831,24 +780,518 @@ def build_panel_embed() -> discord.Embed:
     return embed
 
 
-async def ensure_panel(bot: "FileBot", channel_id: int) -> None:
-    """Postar panelen i kanalen om den inte redan finns."""
+async def ensure_panel(bot: "FileBot", channel_id: int, title: str, build_embed, build_view) -> None:
+    """Postar en panel (embed + knapp) i kanalen om den inte redan finns."""
     channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
     if not isinstance(channel, discord.abc.Messageable):
-        log.warning("UPLOAD_CHANNEL_ID pekar inte på en textkanal.")
+        log.warning("Kanal %s är inte en textkanal.", channel_id)
         return
 
     async for msg in channel.history(limit=100):
-        if (
-            msg.author.id == bot.user.id
-            and msg.embeds
-            and msg.embeds[0].title == PANEL_TITLE
-        ):
-            log.info("Uppladdningspanelen finns redan i kanalen.")
+        if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == title:
+            log.info("Panelen '%s' finns redan.", title)
             return
 
-    await channel.send(embed=build_panel_embed(), view=UploadView())
-    log.info("Uppladdningspanel postad i kanal %s.", channel_id)
+    await channel.send(embed=build_embed(), view=build_view())
+    log.info("Panelen '%s' postad i kanal %s.", title, channel_id)
+
+
+# --------------------------------------------------------------------------- #
+# To-do: uppgiftskort (Discord är databasen – inget sparas på Railways disk)
+# --------------------------------------------------------------------------- #
+@dataclass
+class Task:
+    message: discord.Message
+    title: str
+    notes: str
+    assignee_id: int | None
+    deadline_ts: int | None
+    done: bool
+
+
+def parse_task(message: discord.Message) -> Task | None:
+    if not message.embeds:
+        return None
+    embed = message.embeds[0]
+    status = next((f.value for f in embed.fields if f.name == FIELD_TASK_STATUS), None)
+    if status is None:
+        return None
+
+    assignee = None
+    deadline = None
+    for f in embed.fields:
+        if f.name == FIELD_ASSIGNEE:
+            m = re.search(r"<@!?(\d+)>", f.value or "")
+            assignee = int(m.group(1)) if m else None
+        elif f.name == FIELD_DEADLINE:
+            m = re.search(r"<t:(\d+)", f.value or "")
+            deadline = int(m.group(1)) if m else None
+
+    return Task(
+        message=message,
+        title=embed.title or "(utan titel)",
+        notes=embed.description or "",
+        assignee_id=assignee,
+        deadline_ts=deadline,
+        done="klar" in status.casefold(),
+    )
+
+
+def parse_deadline(text: str) -> datetime | None:
+    """Förstår: idag, imorgon, 25/10, 25/10 18:00, 2026-10-25, 2026-10-25 18:00."""
+    text = text.strip().lower()
+    hour, minute = 23, 59
+    m = re.search(r"\s(\d{1,2}):(\d{2})$", text)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        text = text[: m.start()].strip()
+
+    now = datetime.now(TZ)
+    try:
+        if text in ("idag", "today"):
+            day = now.date()
+        elif text in ("imorgon", "tomorrow"):
+            day = (now + timedelta(days=1)).date()
+        elif (m := re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text)):
+            day = datetime(int(m[1]), int(m[2]), int(m[3])).date()
+        elif (m := re.fullmatch(r"(\d{1,2})[/.\-](\d{1,2})(?:[/.\-](\d{2,4}))?", text)):
+            year = int(m[3]) if m[3] else now.year
+            if year < 100:
+                year += 2000
+            day = datetime(year, int(m[2]), int(m[1])).date()
+            if not m[3] and day < now.date():  # Utan årtal och redan passerat -> nästa år
+                day = datetime(year + 1, int(m[2]), int(m[1])).date()
+        else:
+            return None
+        return datetime(day.year, day.month, day.day, hour, minute, tzinfo=TZ)
+    except ValueError:
+        return None
+
+
+def build_task_embed(title: str, notes: str, user: discord.abc.User, deadline: datetime | None) -> discord.Embed:
+    embed = discord.Embed(
+        title=truncate(title, 256),
+        description=truncate(notes, 4000) if notes else None,
+        color=COLOR_NEW,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.add_field(name=FIELD_TASK_STATUS, value="🔲 Att göra", inline=True)
+    embed.add_field(name=FIELD_ASSIGNEE, value="— ledig —", inline=True)
+    if deadline is not None:
+        ts = int(deadline.timestamp())
+        embed.add_field(name=FIELD_DEADLINE, value=f"<t:{ts}:f>\n<t:{ts}:R>", inline=True)
+    else:
+        embed.add_field(name=FIELD_DEADLINE, value="—", inline=True)
+    embed.set_footer(text=f"Skapad av {user.display_name}")
+    return embed
+
+
+class TaskModal(discord.ui.Modal, title="Ny uppgift"):
+    title_input = discord.ui.TextInput(
+        label="Vad ska göras?",
+        placeholder="T.ex. Modellera hjul till bilen",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=100,
+    )
+    notes_input = discord.ui.TextInput(
+        label="Detaljer (valfritt)",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=1000,
+    )
+    deadline_input = discord.ui.TextInput(
+        label="Deadline (valfritt)",
+        placeholder="imorgon  |  25/10  |  25/10 18:00  |  2026-10-25",
+        style=discord.TextStyle.short,
+        required=False,
+        max_length=30,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = (self.deadline_input.value or "").strip()
+        deadline = None
+        if raw:
+            deadline = parse_deadline(raw)
+            if deadline is None:
+                await interaction.response.send_message(
+                    "❌ Jag förstod inte deadlinen. Skriv t.ex. `imorgon`, `25/10`, "
+                    "`25/10 18:00` eller `2026-10-25`.",
+                    ephemeral=True,
+                    delete_after=QUICK_LIFETIME,
+                )
+                return
+
+        embed = build_task_embed(
+            self.title_input.value.strip(),
+            (self.notes_input.value or "").strip(),
+            interaction.user,
+            deadline,
+        )
+        await interaction.channel.send(embed=embed, view=TaskView())
+        await interaction.response.send_message(
+            "✅ Uppgiften är skapad!", ephemeral=True, delete_after=QUICK_LIFETIME
+        )
+        interaction.client.request_refresh()
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Modal-fel (uppgift)", exc_info=error)
+        msg = "❌ Ett oväntat fel inträffade."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True, delete_after=QUICK_LIFETIME)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True, delete_after=QUICK_LIFETIME)
+
+
+class TodoPanelView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Ny uppgift",
+        style=discord.ButtonStyle.primary,
+        emoji="➕",
+        custom_id="filbot:new_task",
+    )
+    async def new_task_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await interaction.response.send_modal(TaskModal())
+
+
+class TaskView(discord.ui.View):
+    """Knappar på varje uppgiftskort. done=True visar bara Återöppna + Ta bort."""
+
+    def __init__(self, done: bool = False) -> None:
+        super().__init__(timeout=None)
+        if done:
+            self.remove_item(self.done_button)
+            self.remove_item(self.claim_button)
+        else:
+            self.remove_item(self.reopen_button)
+
+    @discord.ui.button(label="Klar", style=discord.ButtonStyle.success, emoji="✅", custom_id="filbot:task_done")
+    async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        embed = interaction.message.embeds[0].copy()
+        set_field(embed, FIELD_TASK_STATUS, f"✅ Klar ({interaction.user.display_name})")
+        embed.color = COLOR_APPROVED
+        await interaction.response.edit_message(embed=embed, view=TaskView(done=True))
+        interaction.client.request_refresh()
+
+    @discord.ui.button(label="Återöppna", style=discord.ButtonStyle.secondary, emoji="↩️", custom_id="filbot:task_reopen")
+    async def reopen_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        embed = interaction.message.embeds[0].copy()
+        set_field(embed, FIELD_TASK_STATUS, "🔲 Att göra")
+        embed.color = COLOR_NEW
+        await interaction.response.edit_message(embed=embed, view=TaskView(done=False))
+        interaction.client.request_refresh()
+
+    @discord.ui.button(label="Ta / släpp", style=discord.ButtonStyle.primary, emoji="🙋", custom_id="filbot:task_claim")
+    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        embed = interaction.message.embeds[0].copy()
+        task = parse_task(interaction.message)
+        if task is not None and task.assignee_id == interaction.user.id:
+            set_field(embed, FIELD_ASSIGNEE, "— ledig —")
+        else:
+            set_field(embed, FIELD_ASSIGNEE, interaction.user.mention)
+        await interaction.response.edit_message(embed=embed)
+        interaction.client.request_refresh()
+
+    @discord.ui.button(label="Ta bort", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="filbot:task_delete")
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer()
+        try:
+            await interaction.message.delete()
+        except discord.HTTPException:
+            log.exception("Kunde inte radera uppgiftskort")
+        interaction.client.request_refresh()
+
+
+def build_todo_panel_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title=TODO_PANEL_TITLE,
+        description=(
+            "Tryck på **➕ Ny uppgift** för att lägga till något som ska göras.\n"
+            "Varje uppgift dyker upp som ett kort här nedanför med knapparna:\n"
+            "✅ **Klar** · 🙋 **Ta / släpp** (ansvarig) · 🗑️ **Ta bort**\n\n"
+            "Boten påminner om deadlines automatiskt och visar allt i dashboarden."
+        ),
+        color=COLOR_NEW,
+    )
+    return embed
+
+
+async def fetch_tasks(bot: "FileBot") -> list[Task]:
+    channel_id = env_int("TODO_CHANNEL_ID")
+    if channel_id is None:
+        return []
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    found: list[Task] = []
+    async for msg in channel.history(limit=200):
+        if msg.author.id != bot.user.id:
+            continue
+        task = parse_task(msg)
+        if task is not None:
+            found.append(task)
+    return found
+
+
+async def check_reminders(bot: "FileBot") -> None:
+    """Påminner om deadlines (en gång när det är <24h kvar, en gång när den passerat)."""
+    now = int(datetime.now(timezone.utc).timestamp())
+    for task in await fetch_tasks(bot):
+        if task.done or task.deadline_ts is None:
+            continue
+
+        msg = task.message
+        embed = msg.embeds[0].copy()
+        footer = embed.footer.text or ""
+
+        if now >= task.deadline_ts and "🔴" not in footer:
+            icon, text = "🔴", "Försenad"
+        elif task.deadline_ts - 86400 <= now < task.deadline_ts and "🔔" not in footer:
+            icon, text = "🔔", "Deadline snart"
+        else:
+            continue
+
+        mention = ""
+        allowed = discord.AllowedMentions.none()
+        if task.assignee_id:
+            mention = f"<@{task.assignee_id}> "
+            allowed = discord.AllowedMentions(users=[discord.Object(id=task.assignee_id)])
+
+        await msg.channel.send(
+            f"{mention}{icon} **{text}:** [{truncate(task.title, 80)}]({msg.jump_url}) "
+            f"– <t:{task.deadline_ts}:R>",
+            allowed_mentions=allowed,
+        )
+        embed.set_footer(text=f"{footer} {icon}".strip())
+        await msg.edit(embed=embed)
+
+
+# --------------------------------------------------------------------------- #
+# Dashboard
+# --------------------------------------------------------------------------- #
+@dataclass
+class ModelInfo:
+    title: str
+    category: str
+    status: str  # "new" | "changes" | "approved"
+    version: int
+    uploader_id: int | None
+    url: str
+    updated_ts: int
+
+
+def classify_status(raw: str) -> str:
+    low = raw.casefold()
+    if STATUS_APPROVED.casefold() in low:
+        return "approved"
+    if STATUS_CHANGES.casefold() in low:
+        return "changes"
+    return "new"
+
+
+async def collect_models(bot: "FileBot") -> list[ModelInfo]:
+    forum = bot.get_channel(FORUM_CHANNEL_ID)
+    if forum is None:
+        forum = await bot.fetch_channel(FORUM_CHANNEL_ID)
+    if not isinstance(forum, discord.ForumChannel):
+        return []
+
+    threads = {t.id: t for t in forum.threads}
+    try:
+        async for t in forum.archived_threads(limit=50):
+            threads.setdefault(t.id, t)
+    except discord.HTTPException:
+        log.warning("Kunde inte hämta arkiverade trådar (saknar Read Message History?)")
+
+    sem = asyncio.Semaphore(5)
+
+    async def load(thread: discord.Thread) -> ModelInfo | None:
+        async with sem:
+            try:
+                starter = await thread.fetch_message(thread.id)
+            except discord.HTTPException:
+                return None
+        if starter.author.id != bot.user.id or not starter.embeds:
+            return None
+        embed = starter.embeds[0]
+        status_raw = next((f.value for f in embed.fields if f.name == FIELD_STATUS), None)
+        if status_raw is None:
+            return None
+        category = next((f.value for f in embed.fields if f.name == "📂 Kategori"), "–")
+        if thread.last_message_id:
+            updated = int(discord.utils.snowflake_time(thread.last_message_id).timestamp())
+        else:
+            updated = int(starter.created_at.timestamp())
+        return ModelInfo(
+            title=embed.title or thread.name,
+            category=category,
+            status=classify_status(status_raw),
+            version=current_version(embed),
+            uploader_id=uploader_id(embed),
+            url=thread.jump_url,
+            updated_ts=updated,
+        )
+
+    results = await asyncio.gather(*(load(t) for t in list(threads.values())[:40]))
+    return [r for r in results if r is not None]
+
+
+def progress_bar(done: int, total: int, width: int = 12) -> str:
+    filled = round(width * done / total) if total else 0
+    return "▓" * filled + "░" * (width - filled)
+
+
+def fit_lines(lines: list[str], limit: int = 1000) -> str:
+    out: list[str] = []
+    used = 0
+    for i, line in enumerate(lines):
+        if used + len(line) + 1 > limit - 30:
+            out.append(f"… +{len(lines) - i} till")
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out) or "—"
+
+
+async def build_dashboard(bot: "FileBot") -> discord.Embed:
+    now = int(datetime.now(timezone.utc).timestamp())
+    models = await collect_models(bot)
+    task_list = await fetch_tasks(bot)
+
+    models_done = sum(1 for m in models if m.status == "approved")
+    open_tasks = [t for t in task_list if not t.done]
+    tasks_done = len(task_list) - len(open_tasks)
+    overdue = [t for t in open_tasks if t.deadline_ts is not None and t.deadline_ts < now]
+    needs_changes = sum(1 for m in models if m.status == "changes")
+
+    embed = discord.Embed(
+        title=DASHBOARD_TITLE,
+        description=(
+            f"🧊 **Modeller**  `{progress_bar(models_done, len(models))}`  {models_done}/{len(models)} klara\n"
+            f"📋 **Uppgifter**  `{progress_bar(tasks_done, len(task_list))}`  {tasks_done}/{len(task_list)} klara"
+        ),
+        timestamp=discord.utils.utcnow(),
+    )
+
+    if models and models_done == len(models) and not open_tasks:
+        embed.color = COLOR_APPROVED
+    elif overdue or needs_changes:
+        embed.color = COLOR_CHANGES
+    else:
+        embed.color = COLOR_NEW
+
+    # Modeller, grupperade efter status
+    groups = [
+        ("🛠️ Behöver ändras", "changes"),
+        ("🆕 Nya", "new"),
+        ("✅ Klara", "approved"),
+    ]
+    for label, key in groups:
+        items = sorted((m for m in models if m.status == key), key=lambda m: -m.updated_ts)
+        if not items:
+            continue
+        lines = []
+        for m in items:
+            line = f"[{truncate(m.title, 40)}]({m.url}) · v{m.version}"
+            if m.uploader_id:
+                line += f" · <@{m.uploader_id}>"
+            line += f" · <t:{m.updated_ts}:R>"
+            lines.append(line)
+        embed.add_field(name=f"{label} ({len(items)})", value=fit_lines(lines), inline=False)
+
+    if not models:
+        embed.add_field(name="🧊 Modeller", value="Inga modeller uppladdade än.", inline=False)
+
+    # To-do
+    open_sorted = sorted(
+        open_tasks,
+        key=lambda t: (t.deadline_ts is None, t.deadline_ts or 0),
+    )
+    lines = []
+    for t in open_sorted:
+        if t.deadline_ts is not None and t.deadline_ts < now:
+            icon = "🔴"
+        elif t.deadline_ts is not None and t.deadline_ts - 86400 < now:
+            icon = "🟡"
+        else:
+            icon = "🔲"
+        line = f"{icon} [{truncate(t.title, 45)}]({t.message.jump_url})"
+        line += f" · <@{t.assignee_id}>" if t.assignee_id else " · ledig"
+        if t.deadline_ts is not None:
+            line += f" · <t:{t.deadline_ts}:R>"
+        lines.append(line)
+    todo_value = fit_lines(lines) if lines else "🎉 Inget kvar att göra!"
+    embed.add_field(name=f"📋 To-do ({len(open_tasks)} öppna)", value=todo_value, inline=False)
+
+    embed.set_footer(text="Uppdateras automatiskt")
+    return embed
+
+
+async def update_dashboard(bot: "FileBot") -> None:
+    channel_id = env_int("DASHBOARD_CHANNEL_ID")
+    if channel_id is None:
+        return
+
+    channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
+    embed = await build_dashboard(bot)
+
+    message = bot._dashboard_message
+    if message is None:
+        async for msg in channel.history(limit=100):
+            if (
+                msg.author.id == bot.user.id
+                and msg.embeds
+                and msg.embeds[0].title == DASHBOARD_TITLE
+            ):
+                message = msg
+                break
+
+    if message is not None:
+        try:
+            await message.edit(embed=embed)
+            bot._dashboard_message = message
+            return
+        except discord.NotFound:
+            message = None
+
+    bot._dashboard_message = await channel.send(embed=embed)
+
+
+class HQCog(commands.Cog):
+    """Bakgrundsjobb: dashboard-uppdatering och deadline-påminnelser."""
+
+    def __init__(self, bot: "FileBot") -> None:
+        self.bot = bot
+
+    async def cog_load(self) -> None:
+        self.dashboard_loop.start()
+        self.reminder_loop.start()
+
+    async def cog_unload(self) -> None:
+        self.dashboard_loop.cancel()
+        self.reminder_loop.cancel()
+
+    @tasks.loop(minutes=10)
+    async def dashboard_loop(self) -> None:
+        try:
+            await update_dashboard(self.bot)
+        except Exception:
+            log.exception("Dashboard-uppdatering misslyckades")
+
+    @tasks.loop(minutes=30)
+    async def reminder_loop(self) -> None:
+        try:
+            await check_reminders(self.bot)
+        except Exception:
+            log.exception("Påminnelsekontroll misslyckades")
+
+    @dashboard_loop.before_loop
+    @reminder_loop.before_loop
+    async def _wait_until_ready(self) -> None:
+        await self.bot.wait_until_ready()
 
 
 # --------------------------------------------------------------------------- #
@@ -859,29 +1302,71 @@ class FileBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True  # Krävs för !setup och för att läsa bilagor
         super().__init__(command_prefix="!", intents=intents)
-        self._panel_checked = False
+        self._panels_checked = False
+        self._dashboard_message: discord.Message | None = None
+        self._refresh_task: asyncio.Task | None = None
+        self._refresh_pending = False
 
     async def setup_hook(self) -> None:
         # Registrera permanenta knappar så de fungerar efter omstart
         self.add_view(UploadView())
         self.add_view(ThreadView())
+        self.add_view(TodoPanelView())
+        self.add_view(TaskView())
         await self.add_cog(SetupCog(self))
+        await self.add_cog(HQCog(self))
         await self.tree.sync()
+
+    # -- Dashboard-uppdatering med fördröjning (slår ihop många ändringar) -- #
+    def request_refresh(self) -> None:
+        self._refresh_pending = True
+        if self._refresh_task is None or self._refresh_task.done():
+            self._refresh_task = asyncio.create_task(self._refresh_worker())
+
+    async def _refresh_worker(self) -> None:
+        while True:
+            await asyncio.sleep(3)
+            self._refresh_pending = False
+            try:
+                await update_dashboard(self)
+            except Exception:
+                log.exception("Dashboard-uppdatering misslyckades")
+            if not self._refresh_pending:
+                break
+
+    # -- Forum-händelser som påverkar dashboarden -- #
+    async def on_thread_create(self, thread: discord.Thread) -> None:
+        if thread.parent_id == FORUM_CHANNEL_ID:
+            self.request_refresh()
+
+    async def on_raw_thread_update(self, payload: discord.RawThreadUpdateEvent) -> None:
+        if payload.parent_id == FORUM_CHANNEL_ID:
+            self.request_refresh()
+
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        if payload.parent_id == FORUM_CHANNEL_ID:
+            self.request_refresh()
 
     async def on_ready(self) -> None:
         log.info("Inloggad som %s (ID: %s)", self.user, self.user.id)
 
         # Kör bara första gången (on_ready kan triggas flera gånger)
-        if self._panel_checked:
+        if self._panels_checked:
             return
-        self._panel_checked = True
+        self._panels_checked = True
 
-        raw = os.environ.get("UPLOAD_CHANNEL_ID")
-        if raw and raw.isdigit():
+        panels = [
+            ("UPLOAD_CHANNEL_ID", PANEL_TITLE, build_panel_embed, UploadView),
+            ("TODO_CHANNEL_ID", TODO_PANEL_TITLE, build_todo_panel_embed, TodoPanelView),
+        ]
+        for env_name, title, build_embed, build_view in panels:
+            channel_id = env_int(env_name)
+            if channel_id is None:
+                continue
             try:
-                await ensure_panel(self, int(raw))
+                await ensure_panel(self, channel_id, title, build_embed, build_view)
             except Exception:
-                log.exception("Kunde inte säkerställa uppladdningspanelen")
+                log.exception("Kunde inte säkerställa panelen för %s", env_name)
 
 
 class SetupCog(commands.Cog):
