@@ -5,7 +5,7 @@ import threading
 import discord
 from discord.ext import commands
 
-# 1. Starta en minimal webbserver så att Render Web Service hålls nöjd
+# 1. Starta en minimal webbserver så att Render/Railway hålls nöjda
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -110,7 +110,7 @@ class UploadView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Ladda upp fil", style=discord.ButtonStyle.primary, custom_id="upload_button", emoji="📤")
-    async def upload_button_callback(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def upload_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(UploadModal())
 
 @bot.tree.command(name="setup_laddaupp", description="Skickar knappen för filuppladdning i den här kanalen")
