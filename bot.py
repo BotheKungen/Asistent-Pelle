@@ -5,7 +5,7 @@ import threading
 import discord
 from discord.ext import commands
 
-# 1. Webbserver för hälso-check
+# 1. Starta en minimal webbserver så att Render/Railway hålls nöjda
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -19,14 +19,15 @@ def run_health_check_server():
 
 threading.Thread(target=run_health_check_server, daemon=True).start()
 
-# 2. Setup
+# 2. Discord Bot Setup
 TOKEN = os.getenv("TOKEN")
-FORUM_CHANNEL_ID = 1559907105279053926
+FORUM_CHANNEL_ID = 1559907105279053926  # ID för er # filer-forumkanal
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Formulär med Val av Kategori
 class UploadModal(discord.ui.Modal, title="Ladda upp fil till Forum"):
     asset_name = discord.ui.TextInput(
         label="Titel / Namn på asset",
@@ -42,7 +43,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil till Forum"):
     description = discord.ui.TextInput(
         label="Beskrivning / Ändringar",
         style=discord.TextStyle.long,
-        placeholder="T.ex. Fixat UV-maps, riggat chassi...",
+        placeholder="T.ex. Fixat UV-maps, riggat chassi och lagt till textures...",
         required=False
     )
 
@@ -65,12 +66,14 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil till Forum"):
                 await interaction.followup.send("Kunde inte hitta forumkanalen. Kontrollera att kanalen är ett Forum.", ephemeral=True)
                 return
 
+            # Matcha tagg i forumet om det finns
             applied_tags = []
             for tag in forum_channel.available_tags:
                 if tag.name.lower() in self.category.value.lower() or self.category.value.lower() in tag.name.lower():
                     applied_tags.append(tag)
                     break
 
+            # Snyggt Embed-kort i foruminlägget
             embed = discord.Embed(
                 title=f"📦 {self.asset_name.value}",
                 description=self.description.value if self.description.value else "Ingen beskrivning angiven.",
@@ -83,6 +86,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil till Forum"):
 
             file_data = await attachment.to_file()
 
+            # Skapa nytt inlägg i forumet
             thread_with_message = await forum_channel.create_thread(
                 name=f"[{self.category.value}] {self.asset_name.value}",
                 content="@everyone Ny fil uppladdad!",
@@ -110,3 +114,23 @@ class UploadView(discord.ui.View):
         # Skottsäker lösning som hittar interaktionen oavsett ordning
         interaction = arg1 if hasattr(arg1, 'response') else arg2
         await interaction.response.send_modal(UploadModal())
+
+# --- DESSA RADER SAKNADES I DITT MEDDELANDE ---
+
+@bot.tree.command(name="setup_laddaupp", description="Skickar knappen för filuppladdning i den här kanalen")
+async def setup(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="Filuppladdning till Forum",
+        description="Klicka på knappen nedan för att skapa ett nytt inlägg i `# 📂 filer` med dina `.blend`-, `.fbx`- eller projektfiler.",
+        color=discord.Color.blurple()
+    )
+    await interaction.channel.send(embed=embed, view=UploadView())
+    await interaction.response.send_message("Knapp skapad!", ephemeral=True)
+
+@bot.event
+async def on_ready():
+    await bot.tree.sync()
+    bot.add_view(UploadView())
+    print(f"Boten är inloggad som {bot.user}")
+
+bot.run(TOKEN)
