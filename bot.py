@@ -105,24 +105,8 @@ class UploadView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Ladda upp fil", style=discord.ButtonStyle.primary, custom_id="upload_button_v2", emoji="📤")
-    async def upload_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Ladda upp fil", style=discord.ButtonStyle.primary, custom_id="upload_button_final", emoji="📤")
+    async def upload_button_callback(self, arg1, arg2):
+        # Skottsäker lösning som hittar interaktionen oavsett ordning
+        interaction = arg1 if hasattr(arg1, 'response') else arg2
         await interaction.response.send_modal(UploadModal())
-
-@bot.tree.command(name="setup_laddaupp", description="Skickar knappen för filuppladdning i den här kanalen")
-async def setup(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="Filuppladdning till Forum",
-        description="Klicka på knappen nedan för att skapa ett nytt inlägg i `# 📂 filer` med dina `.blend`-, `.fbx`- eller projektfiler.",
-        color=discord.Color.blurple()
-    )
-    await interaction.channel.send(embed=embed, view=UploadView())
-    await interaction.response.send_message("Knapp skapad!", ephemeral=True)
-
-@bot.event
-async def on_ready():
-    await bot.tree.sync()
-    bot.add_view(UploadView())
-    print(f"Boten är inloggad som {bot.user}")
-
-bot.run(TOKEN)
