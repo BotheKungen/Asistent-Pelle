@@ -3,7 +3,8 @@ Discord-bot för att dela 3D-projektfiler (.blend, .fbx, ...) till en forumkanal
 
 Flöde:
   /setup_laddaupp (eller !setup)  ->  Embed med permanent knapp "Ladda upp fil"
-  Knapp -> Modal (titel, kategori, beskrivning) -> dold uppmaning att bifoga fil
+  Knapp -> dold rullista med kategorier (forumets taggar) -> Modal (titel, beskrivning)
+  -> dold uppmaning att bifoga fil
   -> wait_for('message') -> skapar forumtråd med embed + fil + tagg
   -> raderar uppladdningsmeddelandet -> dold bekräftelse med länk.
 
@@ -29,7 +30,8 @@ from discord.ext import commands
 # --------------------------------------------------------------------------- #
 FORUM_CHANNEL_ID = 1559907105279053926
 UPLOAD_TIMEOUT_SECONDS = 120
-FALLBACK_TAG_NAME = "övrigt"  # Används om ingen tagg matchar kategorin
+# Används bara om forumet inte har några taggar eller inte kan hämtas
+FALLBACK_CATEGORIES = ["Bilar", "Bildelar", "Karaktärer", "Övrigt"]
 EMBED_COLOR = discord.Color.from_rgb(88, 101, 242)
 
 log = logging.getLogger("filbot")
@@ -66,34 +68,6 @@ def start_http_server() -> None:
 # --------------------------------------------------------------------------- #
 # Hjälpfunktioner
 # --------------------------------------------------------------------------- #
-def find_matching_tag(forum: discord.ForumChannel, category: str) -> discord.ForumTag | None:
-    """Matchar användarens kategori mot forumets available_tags."""
-    wanted = category.strip().casefold()
-    tags = forum.available_tags
-
-    # 1. Exakt match (skiftlägesokänslig)
-    for tag in tags:
-        if tag.name.strip().casefold() == wanted:
-            return tag
-
-    # 2. Delvis match åt något håll (t.ex. "bil" ~ "Bilar")
-    for tag in tags:
-        name = tag.name.strip().casefold()
-        if wanted and (wanted in name or name in wanted):
-            return tag
-
-    # 3. Fallback till "Övrigt"
-    for tag in tags:
-        if tag.name.strip().casefold() == FALLBACK_TAG_NAME:
-            return tag
-
-    # 4. Om forumet kräver tagg men inget matchar: ta första
-    if forum.flags.require_tag and tags:
-        return tags[0]
-
-    return None
-
-
 def truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -109,13 +83,6 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         required=True,
         max_length=80,
     )
-    category_input = discord.ui.TextInput(
-        label="Kategori / Tagg",
-        placeholder="Bilar, Bildelar, Karaktärer, Övrigt ...",
-        style=discord.TextStyle.short,
-        required=True,
-        max_length=40,
-    )
     description_input = discord.ui.TextInput(
         label="Beskrivning (valfritt)",
         placeholder="Berätta lite om projektet ...",
@@ -124,11 +91,16 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         max_length=1500,
     )
 
+    def __init__(self, category: str, tag_id: int | None) -> None:
+        super().__init__()
+        self.category = category
+        self.tag_id = tag_id
+
     async def on_submit(self, interaction: discord.Interaction) -> None:
         bot: "FileBot" = interaction.client  # type: ignore[assignment]
 
         title = self.title_input.value.strip()
-        category = self.category_input.value.strip()
+        category = self.category
         description = (self.description_input.value or "").strip()
 
         await interaction.response.send_message(
@@ -213,7 +185,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         embed.set_footer(text=f"Uppladdad av {user.display_name}")
 
         thread_name = truncate(f"[{category}] {title}", 100)
-        tag = find_matching_tag(forum, category)
+        tag = forum.get_tag(self.tag_id) if self.tag_id is not None else None
 
         kwargs = {}
         if tag is not None:
@@ -235,7 +207,7 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         except (discord.Forbidden, discord.NotFound):
             log.warning("Kunde inte radera uppladdningsmeddelandet (saknar Manage Messages?)")
 
-        tag_info = f"\n🏷️ Tagg: **{tag.name}**" if tag else "\n🏷️ Ingen matchande tagg hittades."
+        tag_info = f"\n🏷️ Kategori: **{category}**"
         await interaction.followup.send(
             f"✅ Din fil har laddats upp!{tag_info}\n{thread.jump_url}",
             ephemeral=True,
@@ -248,6 +220,46 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
             await interaction.followup.send(msg, ephemeral=True)
         else:
             await interaction.response.send_message(msg, ephemeral=True)
+
+
+# --------------------------------------------------------------------------- #
+# Kategorival (rullista)
+# --------------------------------------------------------------------------- #
+class CategorySelect(discord.ui.Select):
+    def __init__(self, forum: discord.ForumChannel | None) -> None:
+        options: list[discord.SelectOption] = []
+        if forum is not None and forum.available_tags:
+            for tag in forum.available_tags[:25]:  # Discord tillåter max 25 alternativ
+                options.append(
+                    discord.SelectOption(
+                        label=truncate(tag.name, 100),
+                        value=str(tag.id),
+                        emoji=tag.emoji,
+                    )
+                )
+        else:
+            for name in FALLBACK_CATEGORIES:
+                options.append(discord.SelectOption(label=name, value=f"name:{name}"))
+
+        super().__init__(
+            placeholder="Välj kategori ...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        value = self.values[0]
+        chosen = next(o for o in self.options if o.value == value)
+
+        tag_id = None if value.startswith("name:") else int(value)
+        await interaction.response.send_modal(UploadModal(chosen.label, tag_id))
+
+
+class CategoryView(discord.ui.View):
+    def __init__(self, forum: discord.ForumChannel | None) -> None:
+        super().__init__(timeout=180)
+        self.add_item(CategorySelect(forum))
 
 
 # --------------------------------------------------------------------------- #
@@ -266,7 +278,15 @@ class UploadView(discord.ui.View):
     async def upload_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await interaction.response.send_modal(UploadModal())
+        forum = interaction.client.get_channel(FORUM_CHANNEL_ID)
+        if not isinstance(forum, discord.ForumChannel):
+            forum = None
+
+        await interaction.response.send_message(
+            "📂 Välj vilken **kategori** din fil tillhör:",
+            view=CategoryView(forum),
+            ephemeral=True,
+        )
 
 
 # --------------------------------------------------------------------------- #
