@@ -62,15 +62,20 @@ class UploadView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="Ladda upp fil", style=discord.ButtonStyle.primary, custom_id="upload_btn_v3", emoji="📤")
-    async def upload_button_callback(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(UploadModal())
-
-@bot.tree.command(name="setup_laddaupp", description="Skapa uppladdningsknappen")
-async def setup(interaction: discord.Interaction):
-    embed = discord.Embed(title="Filuppladdning", description="Klicka nedan för att ladda upp till forumet.", color=discord.Color.blurple())
-    await interaction.channel.send(embed=embed, view=UploadView())
-    await interaction.response.send_message("Knapp skapad!", ephemeral=True)
+@discord.ui.button(
+    label="Ladda upp fil",
+    style=discord.ButtonStyle.primary,
+    custom_id="upload_btn_v3",
+    emoji="📤"
+)
+async def upload_button_callback(
+    self,
+    interaction: discord.Interaction,
+    button: discord.ui.Button
+):
+    print("interaction:", type(interaction))
+    print("button:", type(button))
+    await interaction.response.send_modal(UploadModal())
 
 @bot.event
 async def on_ready():
