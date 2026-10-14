@@ -15,6 +15,9 @@ Miljövariabler:
   UPLOAD_CHANNEL_ID  (valfri)        Kanal där boten själv ser till att uppladdningspanelen finns
   TODO_CHANNEL_ID    (valfri)        Kanal för to-do-listan (panel + uppgiftskort)
   DASHBOARD_CHANNEL_ID (valfri)      Kanal där dashboarden visas och uppdateras automatiskt
+  PUBLIC_URL         (valfri)        Bottens publika adress för 3D-vyn, t.ex. https://min-bot.up.railway.app
+                                     (Railway sätter RAILWAY_PUBLIC_DOMAIN själv när du genererar en domän)
+  VIEWER_SECRET      (valfri)        Hemlig nyckel för 3D-länkarna (annars används bottens token)
 
 Kräver: discord.py >= 2.4  (och gärna tzdata, för svensk tid på deadlines)
 
@@ -24,6 +27,9 @@ Tips: skapa dessa taggar i forumet så får du statusen som riktiga taggar ocks�
 
 import array
 import asyncio
+import concurrent.futures
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -37,7 +43,9 @@ import zipfile
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from collections import OrderedDict
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 import discord
 from discord import app_commands
@@ -112,34 +120,6 @@ except Exception:  # tzdata saknas -> använd UTC
     TZ = timezone.utc
 
 log = logging.getLogger("filbot")
-
-
-# --------------------------------------------------------------------------- #
-# HTTP-server (håller Railway nöjd)
-# --------------------------------------------------------------------------- #
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = b"Bot is alive!"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, format, *args):  # Tysta HTTP-loggar
-        return
-
-
-def start_http_server() -> None:
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    log.info("HTTP-server startad på port %s", port)
 
 
 # --------------------------------------------------------------------------- #
@@ -491,6 +471,14 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         )
         thread = created.thread
 
+        if c.attachment is not None and is_viewable(c.attachment.filename):
+            url = viewer_url(thread.id)
+            if url:
+                try:
+                    await created.message.edit(view=ThreadView(viewer_url=url))
+                except discord.HTTPException:
+                    log.exception("Kunde inte lägga till 3D-knappen")
+
         await safe_delete(c.message)
         await finish_prompt(interaction)
         bot.request_refresh()
@@ -598,12 +586,23 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
             **kwargs,
         )
 
+        viewable = c.attachment is not None and is_viewable(c.attachment.filename)
+        if viewable and viewer_url(thread.id, version_msg.id):
+            try:
+                await version_msg.edit(view=make_viewer_view(viewer_url(thread.id, version_msg.id)))
+            except discord.HTTPException:
+                log.exception("Kunde inte lägga till 3D-knappen på versionen")
+
         # Uppdatera startmeddelandet: version, länk till senaste filen och status
         if starter_embed is not None:
             set_field(starter_embed, FIELD_VERSION, f"v{version} · [Visa filen]({version_msg.jump_url})")
             set_field(starter_embed, FIELD_STATUS, f"🆕 {STATUS_NEW}")
             starter_embed.color = COLOR_NEW
-            await starter.edit(embed=starter_embed)
+            start_url = viewer_url(thread.id) if viewable else None
+            if start_url:
+                await starter.edit(embed=starter_embed, view=ThreadView(viewer_url=start_url))
+            else:
+                await starter.edit(embed=starter_embed)
         await set_thread_status(thread, STATUS_NEW)
 
         await safe_delete(c.message)
@@ -634,8 +633,17 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
 # Knappar i forumtråden (permanent view)
 # --------------------------------------------------------------------------- #
 class ThreadView(discord.ui.View):
-    def __init__(self) -> None:
+    def __init__(self, viewer_url: str | None = None) -> None:
         super().__init__(timeout=None)
+        if viewer_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="Öppna 3D-vy",
+                    emoji="🔎",
+                    style=discord.ButtonStyle.link,
+                    url=viewer_url,
+                )
+            )
 
     @discord.ui.button(
         label="Ladda upp ny version",
@@ -1110,6 +1118,7 @@ class ModelInfo:
     uploader_id: int | None
     url: str
     updated_ts: int
+    viewer: str | None = None
 
 
 def classify_status(raw: str) -> str:
@@ -1162,6 +1171,11 @@ async def collect_models(bot: "FileBot") -> list[ModelInfo]:
             uploader_id=uploader_id(embed),
             url=thread.jump_url,
             updated_ts=updated,
+            viewer=(
+                viewer_url(thread.id)
+                if any(is_viewable(a.filename) for a in starter.attachments)
+                else None
+            ),
         )
 
     results = await asyncio.gather(*(load(t) for t in list(threads.values())[:40]))
@@ -1228,6 +1242,8 @@ async def build_dashboard(bot: "FileBot") -> discord.Embed:
             if m.uploader_id:
                 line += f" · <@{m.uploader_id}>"
             line += f" · <t:{m.updated_ts}:R>"
+            if m.viewer:
+                line += f" · [🔎]({m.viewer})"
             lines.append(line)
         embed.add_field(name=f"{label} ({len(items)})", value=fit_lines(lines), inline=False)
 
@@ -1944,6 +1960,588 @@ def schedule_model_check(
 
 
 # --------------------------------------------------------------------------- #
+# Webbserver: hälsokontroll + 3D-viewer
+# --------------------------------------------------------------------------- #
+VIEWABLE_EXTENSIONS = {".glb", ".gltf", ".obj", ".stl", ".fbx"}
+VIEWER_MAX_BYTES = 60 * 1024 * 1024  # Största fil som skickas till viewern
+VIEWER_CACHE_BYTES = 150 * 1024 * 1024  # Minnescache så samma modell inte hämtas om och om igen
+
+WEB_BOT: "FileBot | None" = None
+_FILE_CACHE: "OrderedDict[tuple[int, int], bytes]" = OrderedDict()
+
+VIEWER_HTML = r'''<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<title>3D-vy</title>
+<style>
+:root{--bg:#0f1115;--panel:rgba(22,25,32,.88);--text:#e8eaf0;--muted:#9aa3b2;--accent:#5865f2;--ok:#43b581;--warn:#faa61a}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;overflow:hidden;-webkit-tap-highlight-color:transparent}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;outline:none}
+.top{position:fixed;left:0;right:0;top:0;display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:calc(env(safe-area-inset-top,0px) + 10px) 12px 10px;background:linear-gradient(to bottom,var(--panel),rgba(22,25,32,0));pointer-events:none}
+.top>*{pointer-events:auto}
+h1{font-size:17px;font-weight:700;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1 1 200px}
+.chip{font-size:12px;padding:3px 9px;border-radius:99px;background:var(--panel);border:1px solid #2c313c;color:var(--muted);white-space:nowrap}
+select,a.back{font:inherit;font-size:13px;color:var(--text);background:var(--panel);border:1px solid #2c313c;border-radius:10px;padding:7px 10px;text-decoration:none;max-width:70vw}
+.info{position:fixed;left:12px;bottom:calc(env(safe-area-inset-bottom,0px) + 74px);background:var(--panel);border:1px solid #2c313c;border-radius:12px;padding:9px 12px;font-size:12.5px;line-height:1.55;color:var(--muted);backdrop-filter:blur(6px);display:none}
+.info b{color:var(--text);font-weight:600}
+.tools{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;overflow-x:auto;padding:10px 12px calc(env(safe-area-inset-bottom,0px) + 12px);background:linear-gradient(to top,var(--panel),rgba(22,25,32,0));scrollbar-width:none}
+.tools::-webkit-scrollbar{display:none}
+button{font:inherit;font-size:14px;font-weight:600;color:var(--text);background:var(--panel);border:1px solid #2c313c;border-radius:12px;padding:11px 14px;white-space:nowrap;cursor:pointer;backdrop-filter:blur(6px)}
+button.on{background:var(--accent);border-color:var(--accent)}
+.overlay{position:fixed;inset:0;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;background:var(--bg);text-align:center;padding:24px}
+.overlay.hide{display:none}
+.bar{width:min(320px,70vw);height:8px;background:#232733;border-radius:99px;overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s}
+.err{color:#ff7b7b;max-width:520px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="top">
+  <h1 id="title">Laddar ...</h1>
+  <span class="chip" id="cat" hidden></span>
+  <span class="chip" id="status" hidden></span>
+  <select id="ver" hidden aria-label="Version"></select>
+  <a class="back" id="back" href="#" hidden>💬 Discord</a>
+</div>
+<div class="info" id="info"></div>
+<div class="tools" id="tools">
+  <button data-act="wire">▦ Wireframe</button>
+  <button data-act="uv">🏁 UV-rutor</button>
+  <button data-act="normals">🧭 Normaler</button>
+  <button data-act="grid" class="on">⌗ Rutnät</button>
+  <button data-act="spin">🔄 Snurra</button>
+  <button data-act="axis">↕ Vänd upp</button>
+  <button data-act="bg">🎨 Bakgrund</button>
+  <button data-act="info" class="on">ℹ️ Info</button>
+  <button data-act="reset">🎯 Återställ</button>
+</div>
+<div class="overlay" id="ov"><div id="ovmsg">Hämtar modell ...</div><div class="bar"><i id="prog"></i></div></div>
+
+<script type="importmap">
+{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { STLLoader } from 'three/addons/loaders/STLLoader.js';
+import { FBXLoader } from 'three/addons/loaders/FBXLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const CFG = __CFG__;
+const $ = s => document.querySelector(s);
+const BGS = ['#0f1115', '#d9dde4', '#6b7280', '#101a2b'];
+
+const canvas = $('#c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.autoRotateSpeed = 2.0;
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 0.5));
+const sun = new THREE.DirectionalLight(0xffffff, 1.3);
+sun.position.set(3, 6, 4);
+scene.add(sun);
+
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+resize();
+
+const state = { wire: false, mode: 'shaded', grid: true, spin: false, axis: false, bg: 0, info: true };
+let model = null, gridHelper = null, firstLoad = true, lastStats = null, lastMeta = null;
+
+function makeChecker() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 512;
+  const g = c.getContext('2d');
+  const n = 16, s = 512 / n;
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+    g.fillStyle = (x + y) % 2 ? '#fafafa' : '#3b82f6';
+    g.fillRect(x * s, y * s, s, s);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 8;
+  return t;
+}
+const checkerMat = new THREE.MeshStandardMaterial({ map: makeChecker(), roughness: 0.8, metalness: 0 });
+const normalMat = new THREE.MeshNormalMaterial();
+
+function applyMode() {
+  if (!model) return;
+  checkerMat.wireframe = state.wire;
+  normalMat.wireframe = state.wire;
+  model.traverse(o => {
+    if (!o.isMesh) return;
+    if (!o.userData.orig) o.userData.orig = o.material;
+    o.material = state.mode === 'uv' ? checkerMat : state.mode === 'normals' ? normalMat : o.userData.orig;
+    (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => { m.wireframe = state.wire; });
+  });
+}
+
+function setBackground() {
+  scene.background = new THREE.Color(BGS[state.bg]);
+  document.body.style.background = BGS[state.bg];
+}
+setBackground();
+
+function disposeModel(obj) {
+  obj.traverse(o => {
+    if (!o.isMesh) return;
+    o.geometry && o.geometry.dispose();
+    const orig = o.userData.orig || o.material;
+    (Array.isArray(orig) ? orig : [orig]).forEach(m => {
+      for (const k in m) { if (m[k] && m[k].isTexture) m[k].dispose(); }
+      m.dispose && m.dispose();
+    });
+  });
+}
+
+function frame(obj, keepCamera) {
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  if (gridHelper) { scene.remove(gridHelper); gridHelper.geometry.dispose(); }
+  gridHelper = new THREE.GridHelper(maxDim * 3, 30, 0x5865f2, 0x3a3f4b);
+  gridHelper.position.set(center.x, box.min.y, center.z);
+  gridHelper.visible = state.grid;
+  scene.add(gridHelper);
+  if (!keepCamera) {
+    const dist = (maxDim / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)))) * 1.9;
+    camera.position.copy(center).add(new THREE.Vector3(1, 0.65, 1).normalize().multiplyScalar(dist));
+    controls.target.copy(center);
+    camera.near = maxDim / 500;
+    camera.far = maxDim * 200;
+    camera.updateProjectionMatrix();
+    controls.update();
+    controls.saveState();
+  }
+  return { size, maxDim };
+}
+
+function collectStats(obj, ext) {
+  let tris = 0, verts = 0, meshes = 0;
+  const mats = new Set();
+  obj.traverse(o => {
+    if (!o.isMesh) return;
+    meshes++;
+    const pos = o.geometry.attributes.position;
+    if (!pos) return;
+    verts += pos.count;
+    tris += o.geometry.index ? o.geometry.index.count / 3 : pos.count / 3;
+    (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => mats.add(m.uuid));
+  });
+  const box = new THREE.Box3().setFromObject(obj);
+  const s = box.getSize(new THREE.Vector3());
+  const unit = (ext === 'glb' || ext === 'gltf') ? 'm' : 'enh.';
+  return { tris, verts, meshes, mats: mats.size, dims: [s.x, s.y, s.z], unit };
+}
+
+const nf = n => Math.round(n).toLocaleString('sv-SE');
+function renderInfo() {
+  const el = $('#info');
+  if (!lastStats || !state.info) { el.style.display = 'none'; return; }
+  const s = lastStats;
+  el.innerHTML =
+    '<b>' + nf(s.tris) + '</b> trianglar · <b>' + nf(s.verts) + '</b> vertices<br>' +
+    '<b>' + s.meshes + '</b> meshar · <b>' + s.mats + '</b> material<br>' +
+    'Storlek <b>' + s.dims.map(d => d.toFixed(2)).join(' × ') + '</b> ' + s.unit +
+    (lastMeta ? '<br><span>' + lastMeta + '</span>' : '');
+  el.style.display = 'block';
+}
+
+async function loadBuffer(url, onprog) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error((await r.text()) || ('HTTP ' + r.status));
+  const total = Number(r.headers.get('Content-Length')) || 0;
+  const reader = r.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    onprog(total ? got / total : null);
+  }
+  const buf = new Uint8Array(got);
+  let p = 0;
+  for (const c of chunks) { buf.set(c, p); p += c.length; }
+  return buf.buffer;
+}
+
+function parseModel(buf, ext) {
+  return new Promise((resolve, reject) => {
+    try {
+      if (ext === 'glb' || ext === 'gltf') {
+        const data = ext === 'gltf' ? new TextDecoder().decode(buf) : buf;
+        new GLTFLoader().parse(data, '', g => resolve(g.scene), reject);
+      } else if (ext === 'obj') {
+        const g = new OBJLoader().parse(new TextDecoder().decode(buf));
+        g.traverse(o => { if (o.isMesh) o.material = new THREE.MeshStandardMaterial({ color: 0xcfd3da, roughness: 0.7 }); });
+        resolve(g);
+      } else if (ext === 'stl') {
+        const geo = new STLLoader().parse(buf);
+        const mesh = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: 0xb8c0cc, roughness: 0.6, metalness: 0.1 }));
+        const g = new THREE.Group();
+        g.add(mesh);
+        g.rotation.x = -Math.PI / 2;
+        resolve(g);
+      } else if (ext === 'fbx') {
+        resolve(new FBXLoader().parse(buf, ''));
+      } else {
+        reject(new Error('Filtypen stöds inte i 3D-vyn.'));
+      }
+    } catch (e) { reject(e); }
+  });
+}
+
+function showOverlay(msg, isErr) {
+  $('#ov').classList.remove('hide');
+  $('#ovmsg').textContent = msg;
+  $('#ovmsg').className = isErr ? 'err' : '';
+  document.querySelector('.bar').style.display = isErr ? 'none' : 'block';
+}
+
+async function show(version) {
+  showOverlay('Hämtar ' + version.filename + ' ...');
+  $('#prog').style.width = '0';
+  try {
+    const buf = await loadBuffer(CFG.file + version.mid + '/' + version.idx, p => {
+      $('#prog').style.width = (p == null ? 50 : Math.round(p * 100)) + '%';
+    });
+    $('#ovmsg').textContent = 'Bygger modellen ...';
+    const obj = await parseModel(buf, version.ext);
+    if (model) { scene.remove(model); disposeModel(model); }
+    model = obj;
+    model.userData.baseRotX = model.rotation.x;
+    scene.add(model);
+    model.rotation.x = model.userData.baseRotX + (state.axis ? -Math.PI / 2 : 0);
+    model.updateMatrixWorld(true);
+    lastStats = collectStats(model, version.ext);
+    lastMeta = version.label + ' · ' + version.filename;
+    applyMode();
+    frame(model, !firstLoad);
+    firstLoad = false;
+    renderInfo();
+    $('#ov').classList.add('hide');
+  } catch (e) {
+    console.error(e);
+    showOverlay('Kunde inte visa modellen: ' + (e && e.message ? e.message : e), true);
+  }
+}
+
+function setActive(act, on) {
+  const b = document.querySelector('[data-act="' + act + '"]');
+  if (b) b.classList.toggle('on', !!on);
+}
+
+$('#tools').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const act = b.dataset.act;
+  if (act === 'wire') { state.wire = !state.wire; setActive('wire', state.wire); applyMode(); }
+  else if (act === 'uv' || act === 'normals') {
+    state.mode = state.mode === act ? 'shaded' : act;
+    setActive('uv', state.mode === 'uv');
+    setActive('normals', state.mode === 'normals');
+    applyMode();
+  }
+  else if (act === 'grid') { state.grid = !state.grid; setActive('grid', state.grid); if (gridHelper) gridHelper.visible = state.grid; }
+  else if (act === 'spin') { state.spin = !state.spin; setActive('spin', state.spin); controls.autoRotate = state.spin; }
+  else if (act === 'axis' && model) {
+    state.axis = !state.axis;
+    setActive('axis', state.axis);
+    model.rotation.x = model.userData.baseRotX + (state.axis ? -Math.PI / 2 : 0);
+    model.updateMatrixWorld(true);
+    frame(model, false);
+  }
+  else if (act === 'bg') { state.bg = (state.bg + 1) % BGS.length; setBackground(); }
+  else if (act === 'info') { state.info = !state.info; setActive('info', state.info); renderInfo(); }
+  else if (act === 'reset') { controls.reset(); }
+});
+
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+
+(async () => {
+  try {
+    const r = await fetch(CFG.api);
+    if (!r.ok) throw new Error((await r.text()) || ('HTTP ' + r.status));
+    const meta = await r.json();
+    document.title = '3D-vy – ' + meta.title;
+    $('#title').textContent = meta.title;
+    if (meta.category) { $('#cat').textContent = '📂 ' + meta.category; $('#cat').hidden = false; }
+    if (meta.status) { $('#status').textContent = meta.status; $('#status').hidden = false; }
+    if (meta.discord_url) { $('#back').href = meta.discord_url; $('#back').hidden = false; }
+    const versions = meta.versions || [];
+    if (!versions.length) { showOverlay('Hittade ingen 3D-fil i den här tråden (stöds: glb, gltf, obj, stl, fbx).', true); return; }
+    const sel = $('#ver');
+    versions.forEach((v, i) => {
+      const o = document.createElement('option');
+      o.value = String(i);
+      o.textContent = v.label + (i === 0 ? ' (senaste)' : '') + ' · ' + v.filename + ' · ' + (v.size / 1048576).toFixed(1) + ' MB';
+      sel.appendChild(o);
+    });
+    sel.hidden = versions.length < 2;
+    let start = 0;
+    if (CFG.m) { const i = versions.findIndex(v => v.mid === CFG.m); if (i >= 0) start = i; }
+    sel.value = String(start);
+    sel.addEventListener('change', () => show(versions[Number(sel.value)]));
+    await show(versions[start]);
+  } catch (e) {
+    console.error(e);
+    showOverlay('Kunde inte öppna 3D-vyn: ' + (e && e.message ? e.message : e), true);
+  }
+})();
+</script>
+</body>
+</html>
+'''
+
+
+class WebError(Exception):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def is_viewable(filename: str) -> bool:
+    return ext_of(filename) in VIEWABLE_EXTENSIONS
+
+
+def _viewer_key() -> bytes:
+    # VIEWER_SECRET om den finns, annars härleds nyckeln från bottens token
+    secret = os.environ.get("VIEWER_SECRET") or os.environ.get("DISCORD_TOKEN") or "dev"
+    return hashlib.sha256(secret.encode()).digest()
+
+
+def viewer_sig(thread_id: int) -> str:
+    return hmac.new(_viewer_key(), str(thread_id).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def viewer_base_url() -> str | None:
+    url = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+    if not url:
+        domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+        if domain:
+            url = f"https://{domain}"
+    return url or None
+
+
+def viewer_url(thread_id: int, message_id: int | None = None) -> str | None:
+    base = viewer_base_url()
+    if base is None:
+        return None
+    url = f"{base}/v/{thread_id}/{viewer_sig(thread_id)}"
+    if message_id:
+        url += f"?m={message_id}"
+    return url
+
+
+def make_viewer_view(url: str) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(label="Öppna 3D-vy", emoji="🔎", style=discord.ButtonStyle.link, url=url))
+    return view
+
+
+async def viewer_thread(bot: "FileBot", thread_id: int) -> discord.Thread:
+    channel = bot.get_channel(thread_id)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(thread_id)
+        except discord.HTTPException:
+            raise WebError(404, "Hittar inte tråden.")
+    if not isinstance(channel, discord.Thread) or channel.parent_id != FORUM_CHANNEL_ID:
+        raise WebError(404, "Hittar inte tråden.")
+    return channel
+
+
+async def viewer_api(bot: "FileBot", thread_id: int) -> dict:
+    thread = await viewer_thread(bot, thread_id)
+    title, category, status = thread.name, "", ""
+    try:
+        starter = await thread.fetch_message(thread.id)
+        if starter.embeds:
+            embed = starter.embeds[0]
+            title = embed.title or title
+            category = next((f.value for f in embed.fields if f.name == "📂 Kategori"), "")
+            status = next((f.value for f in embed.fields if f.name == FIELD_STATUS), "")
+    except discord.HTTPException:
+        pass
+
+    versions = []
+    async for msg in thread.history(limit=200):  # Nyast först
+        if msg.author.id != bot.user.id:
+            continue
+        for idx, att in enumerate(msg.attachments):
+            if not is_viewable(att.filename):
+                continue
+            if msg.id == thread.id:
+                label = "v1"
+            else:
+                m = re.search(r"v(\d+)", msg.embeds[0].title or "") if msg.embeds else None
+                label = f"v{m.group(1)}" if m else "v?"
+            versions.append({
+                "mid": str(msg.id),
+                "idx": idx,
+                "label": label,
+                "filename": att.filename,
+                "size": att.size,
+                "ext": ext_of(att.filename).lstrip("."),
+            })
+    return {
+        "title": title,
+        "category": category,
+        "status": status,
+        "discord_url": thread.jump_url,
+        "versions": versions,
+    }
+
+
+async def viewer_file(bot: "FileBot", thread_id: int, message_id: int, idx: int) -> tuple[bytes, str]:
+    thread = await viewer_thread(bot, thread_id)
+    key = (message_id, idx)
+    try:
+        msg = await thread.fetch_message(message_id)
+    except discord.HTTPException:
+        raise WebError(404, "Hittar inte filen.")
+    if msg.author.id != bot.user.id or idx >= len(msg.attachments):
+        raise WebError(404, "Hittar inte filen.")
+    att = msg.attachments[idx]
+    if not is_viewable(att.filename):
+        raise WebError(415, "Filtypen stöds inte i 3D-vyn.")
+    if att.size > VIEWER_MAX_BYTES:
+        raise WebError(413, f"Filen är för stor för 3D-vyn (max {VIEWER_MAX_BYTES // 1024 // 1024} MB).")
+
+    if key in _FILE_CACHE:
+        _FILE_CACHE.move_to_end(key)
+        return _FILE_CACHE[key], att.filename
+
+    data = await att.read()
+    _FILE_CACHE[key] = data
+    total = sum(len(v) for v in _FILE_CACHE.values())
+    while total > VIEWER_CACHE_BYTES and len(_FILE_CACHE) > 1:
+        _, old = _FILE_CACHE.popitem(last=False)
+        total -= len(old)
+    return data, att.filename
+
+
+def run_on_bot(coro, timeout: float = 45):
+    """Kör en coroutine i botens event loop från webbtråden."""
+    bot = WEB_BOT
+    if bot is None or not bot.is_ready():
+        coro.close()
+        raise WebError(503, "Boten startar – försök igen om en stund.")
+    return asyncio.run_coroutine_threadsafe(coro, bot.loop).result(timeout=timeout)
+
+
+class WebHandler(BaseHTTPRequestHandler):
+    server_version = "FileBot"
+
+    def _send(self, code: int, body: bytes, ctype: str = "text/plain; charset=utf-8", headers: dict | None = None) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Robots-Tag", "noindex")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path in ("/", "/health", "/healthz"):
+                self._send(200, b"Bot is alive!")
+                return
+
+            m = re.fullmatch(r"/v/(\d{1,20})/([0-9a-f]{32})", path)
+            if m:
+                self._check_sig(m)
+                query = parse_qs(parsed.query)
+                focus = query.get("m", [""])[0]
+                cfg = {
+                    "api": f"/api/{m[1]}/{m[2]}",
+                    "file": f"/file/{m[1]}/{m[2]}/",
+                    "m": focus if focus.isdigit() else None,
+                }
+                html = VIEWER_HTML.replace("__CFG__", json.dumps(cfg))
+                self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+                return
+
+            m = re.fullmatch(r"/api/(\d{1,20})/([0-9a-f]{32})", path)
+            if m:
+                self._check_sig(m)
+                data = run_on_bot(viewer_api(WEB_BOT, int(m[1])))
+                self._send(200, json.dumps(data).encode("utf-8"), "application/json; charset=utf-8", {"Cache-Control": "no-store"})
+                return
+
+            m = re.fullmatch(r"/file/(\d{1,20})/([0-9a-f]{32})/(\d{1,20})/(\d{1,2})", path)
+            if m:
+                self._check_sig(m)
+                data, filename = run_on_bot(viewer_file(WEB_BOT, int(m[1]), int(m[3]), int(m[4])))
+                self._send(200, data, "application/octet-stream", {"Cache-Control": "private, max-age=600"})
+                return
+
+            self._send(404, b"Not found")
+        except WebError as exc:
+            self._send(exc.code, exc.message.encode("utf-8"))
+        except concurrent.futures.TimeoutError:
+            self._send(504, "Det tog för lång tid – försök igen.".encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            log.exception("Fel i webbservern för %s", self.path)
+            self._send(500, b"Internal error")
+
+    @staticmethod
+    def _check_sig(m: "re.Match") -> None:
+        if not hmac.compare_digest(viewer_sig(int(m[1])), m[2]):
+            raise WebError(403, "Ogiltig länk.")
+
+    def log_message(self, format, *args):  # Tysta HTTP-loggar
+        return
+
+
+def start_http_server() -> None:
+    port = int(os.environ.get("PORT", 10000))
+    server = ThreadingHTTPServer(("0.0.0.0", port), WebHandler)
+    server.daemon_threads = True
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    log.info("Webbserver startad på port %s", port)
+    if viewer_base_url():
+        log.info("3D-vyn är aktiv på %s", viewer_base_url())
+    else:
+        log.warning("3D-vyn är avstängd: sätt PUBLIC_URL eller generera en publik domän i Railway.")
+
+
+# --------------------------------------------------------------------------- #
 # Bot
 # --------------------------------------------------------------------------- #
 class FileBot(commands.Bot):
@@ -2052,8 +2650,11 @@ def main() -> None:
     if not token:
         raise RuntimeError("Miljövariabeln DISCORD_TOKEN saknas.")
 
+    global WEB_BOT
+    bot = FileBot()
+    WEB_BOT = bot
     start_http_server()
-    FileBot().run(token)
+    bot.run(token)
 
 
 if __name__ == "__main__":
