@@ -575,6 +575,31 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
         else:
             await interaction.response.send_message(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
 
+# --------------------------------------------------------------------------- #
+# Modal: Behöver ändras
+# --------------------------------------------------------------------------- #
+class ChangesModal(discord.ui.Modal, title="Vad behöver ändras?"):
+    reason_input = discord.ui.TextInput(
+        label="Beskrivning av ändringar",
+        placeholder="T.ex. fixa texturerna, modellen är för stor...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1500,
+    )
+
+    def __init__(self, view: "ThreadView") -> None:
+        super().__init__()
+        self.thread_view = view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Skickar vidare texten till status-funktionen
+        await self.thread_view._change_status(
+            interaction, 
+            STATUS_CHANGES, 
+            "🛠️", 
+            COLOR_CHANGES, 
+            reason=self.reason_input.value
+        )
 
 # --------------------------------------------------------------------------- #
 # Knappar i forumtråden (permanent view)
@@ -614,7 +639,8 @@ class ThreadView(discord.ui.View):
     async def changes_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await self._change_status(interaction, STATUS_CHANGES, "🛠️", COLOR_CHANGES)
+        # Öppnar textformuläret
+        await interaction.response.send_modal(ChangesModal(self))
 
     async def _change_status(
         self,
@@ -622,20 +648,26 @@ class ThreadView(discord.ui.View):
         status: str,
         emoji: str,
         color: discord.Color,
+        reason: str | None = None
     ) -> None:
         message = interaction.message
         if message is None or not message.embeds:
-            await interaction.response.send_message(
-                "❌ Hittar inget inlägg att uppdatera.",
-                ephemeral=True,
-                delete_after=EPHEMERAL_LIFETIME,
-            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Hittar inget inlägg att uppdatera.",
+                    ephemeral=True,
+                    delete_after=EPHEMERAL_LIFETIME,
+                )
             return
 
         embed = message.embeds[0].copy()
         set_field(embed, FIELD_STATUS, f"{emoji} {status}")
         embed.color = color
-        await interaction.response.edit_message(embed=embed)
+        
+        if interaction.response.is_done():
+            await interaction.followup.edit_message(message.id, embed=embed)
+        else:
+            await interaction.response.edit_message(embed=embed)
 
         thread = await get_thread(interaction)
         if thread is None:
@@ -649,10 +681,16 @@ class ThreadView(discord.ui.View):
         # Meddela i tråden och pinga uppladdaren (om det inte är hen själv)
         uid = uploader_id(embed)
         text = f"{emoji} **{status}** – satt av {interaction.user.mention}"
+        
+        # LÄGG TILL ANLEDNINGEN OM DEN FINNS:
+        if reason:
+            text += f"\n📝 **Kommentar:** {reason}"
+
         mentions = discord.AllowedMentions.none()
         if uid and uid != interaction.user.id:
             text += f"\n<@{uid}>"
             mentions = discord.AllowedMentions(users=[discord.Object(id=uid)])
+            
         await thread.send(text, allowed_mentions=mentions)
 
 
