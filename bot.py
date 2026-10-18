@@ -70,13 +70,6 @@ STATUS_CHANGES = "Behöver ändras"
 STATUS_APPROVED = "Klar"
 ALL_STATUSES = (STATUS_NEW, STATUS_CHANGES, STATUS_APPROVED)
 
-# Emojis för slutet av trådens titel
-STATUS_EMOJIS = {
-    STATUS_NEW: "🕒",
-    STATUS_CHANGES: "🔴",
-    STATUS_APPROVED: "✅"
-}
-
 FIELD_STATUS = "📌 Status"
 FIELD_VERSION = "🔢 Version"
 
@@ -121,6 +114,7 @@ FIELD_DEADLINE = "⏰ Deadline"
 
 try:
     from zoneinfo import ZoneInfo
+
     TZ = ZoneInfo("Europe/Stockholm")
 except Exception:  # tzdata saknas -> använd UTC
     TZ = timezone.utc
@@ -189,12 +183,11 @@ def find_status_tag(forum: discord.ForumChannel, status: str) -> discord.ForumTa
 
 
 async def set_thread_status(thread: discord.Thread, status: str) -> None:
-    """Byter statustagg på tråden (behåller kategori-taggen) och uppdaterar titel-emojin."""
+    """Byter statustagg på tråden (behåller kategori-taggen)."""
     forum = thread.parent
     if not isinstance(forum, discord.ForumChannel):
         return
 
-    # Hantera taggar
     status_names = {s.casefold() for s in ALL_STATUSES}
     keep = [t for t in thread.applied_tags if t.name.strip().casefold() not in status_names]
     new_tag = find_status_tag(forum, status)
@@ -202,31 +195,9 @@ async def set_thread_status(thread: discord.Thread, status: str) -> None:
         keep.append(new_tag)
     keep = keep[:5]  # Discord tillåter max 5 taggar per tråd
 
-    # Hantera trådens namn (Titel-emoji)
-    current_name = thread.name
-    clean_name = current_name
-    for e in STATUS_EMOJIS.values():
-        if clean_name.endswith(e):
-            clean_name = clean_name[:-len(e)].strip()
-    
-    # Discord tillåter max 100 tecken, vi stannar vid 95 för säkerhets skull
-    new_name = f"{truncate(clean_name, 95)} {STATUS_EMOJIS.get(status, '')}"
-
-    # Skapa uppdateringen
-    edit_kwargs = {"archived": False}
-    if new_name != current_name:
-        edit_kwargs["name"] = new_name
-    
-    current_tag_ids = {t.id for t in thread.applied_tags}
-    new_tag_ids = {t.id for t in keep}
-    if current_tag_ids != new_tag_ids:
-        edit_kwargs["applied_tags"] = keep
-
-    if len(edit_kwargs) == 1 and "archived" in edit_kwargs:
-        if not thread.archived:
-            return  # Inget behöver ändras
-
-    await thread.edit(**edit_kwargs)
+    if new_tag is None and len(keep) == len(thread.applied_tags):
+        return  # Inget att ändra
+    await thread.edit(applied_tags=keep, archived=False)
 
 
 async def get_thread(interaction: discord.Interaction) -> discord.Thread | None:
@@ -490,12 +461,8 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
         if c.files:
             kwargs["files"] = c.files
 
-        # Sätt trådens namn direkt med den första emojin (Klockan)
-        base_name = f"[{category}] {title}"
-        thread_name = f"{truncate(base_name, 95)} {STATUS_EMOJIS[STATUS_NEW]}"
-
         created = await forum.create_thread(
-            name=thread_name,
+            name=truncate(f"[{category}] {title}", 100),
             content="@everyone",
             embed=embed,
             view=ThreadView(),
@@ -636,7 +603,6 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
                 await starter.edit(embed=starter_embed, view=ThreadView(viewer_url=start_url))
             else:
                 await starter.edit(embed=starter_embed)
-        
         await set_thread_status(thread, STATUS_NEW)
 
         await safe_delete(c.message)
@@ -662,31 +628,6 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
         else:
             await interaction.response.send_message(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
 
-# --------------------------------------------------------------------------- #
-# Modal: Behöver ändras
-# --------------------------------------------------------------------------- #
-class ChangesModal(discord.ui.Modal, title="Vad behöver ändras?"):
-    reason_input = discord.ui.TextInput(
-        label="Beskrivning av ändringar",
-        placeholder="T.ex. fixa texturerna, modellen är för stor...",
-        style=discord.TextStyle.paragraph,
-        required=True,
-        max_length=1500,
-    )
-
-    def __init__(self, view: "ThreadView") -> None:
-        super().__init__()
-        self.thread_view = view
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        # Skickar vidare texten till status-funktionen
-        await self.thread_view._change_status(
-            interaction, 
-            STATUS_CHANGES, 
-            "🛠️", 
-            COLOR_CHANGES, 
-            reason=self.reason_input.value
-        )
 
 # --------------------------------------------------------------------------- #
 # Knappar i forumtråden (permanent view)
@@ -735,7 +676,7 @@ class ThreadView(discord.ui.View):
     async def changes_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await interaction.response.send_modal(ChangesModal(self))
+        await self._change_status(interaction, STATUS_CHANGES, "🛠️", COLOR_CHANGES)
 
     async def _change_status(
         self,
@@ -743,27 +684,20 @@ class ThreadView(discord.ui.View):
         status: str,
         emoji: str,
         color: discord.Color,
-        reason: str | None = None
     ) -> None:
         message = interaction.message
         if message is None or not message.embeds:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ Hittar inget inlägg att uppdatera.",
-                    ephemeral=True,
-                    delete_after=EPHEMERAL_LIFETIME,
-                )
+            await interaction.response.send_message(
+                "❌ Hittar inget inlägg att uppdatera.",
+                ephemeral=True,
+                delete_after=EPHEMERAL_LIFETIME,
+            )
             return
 
         embed = message.embeds[0].copy()
         set_field(embed, FIELD_STATUS, f"{emoji} {status}")
         embed.color = color
-        
-        if interaction.response.is_done():
-            await interaction.followup.edit_message(message.id, embed=embed)
-        else:
-            await interaction.response.edit_message(embed=embed)
-            
+        await interaction.response.edit_message(embed=embed)
         interaction.client.request_refresh()
 
         thread = await get_thread(interaction)
@@ -773,21 +707,15 @@ class ThreadView(discord.ui.View):
         try:
             await set_thread_status(thread, status)
         except discord.HTTPException:
-            log.exception("Kunde inte byta statustagg eller uppdatera namnet")
+            log.exception("Kunde inte byta statustagg")
 
         # Meddela i tråden och pinga uppladdaren (om det inte är hen själv)
         uid = uploader_id(embed)
         text = f"{emoji} **{status}** – satt av {interaction.user.mention}"
-        
-        # Om det finns en "behöver ändras"-kommentar
-        if reason:
-            text += f"\n📝 **Kommentar:** {reason}"
-            
         mentions = discord.AllowedMentions.none()
         if uid and uid != interaction.user.id:
             text += f"\n<@{uid}>"
             mentions = discord.AllowedMentions(users=[discord.Object(id=uid)])
-            
         await thread.send(text, allowed_mentions=mentions)
 
 
@@ -852,20 +780,15 @@ class UploadView(discord.ui.View):
     async def upload_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        # Säkerhet så boten hinner hämta kategorier utan att dö i Discord (15 min timer)
-        await interaction.response.defer(ephemeral=True)
-        
         forum = interaction.client.get_channel(FORUM_CHANNEL_ID)
         if not isinstance(forum, discord.ForumChannel):
-            try:
-                forum = await interaction.client.fetch_channel(FORUM_CHANNEL_ID)
-            except discord.HTTPException:
-                forum = None
+            forum = None
 
-        await interaction.followup.send(
+        await interaction.response.send_message(
             "📂 Välj vilken **kategori** din fil tillhör:",
             view=CategoryView(forum),
             ephemeral=True,
+            delete_after=EPHEMERAL_LIFETIME,
         )
 
 
