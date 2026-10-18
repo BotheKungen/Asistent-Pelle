@@ -70,6 +70,13 @@ STATUS_CHANGES = "Behöver ändras"
 STATUS_APPROVED = "Klar"
 ALL_STATUSES = (STATUS_NEW, STATUS_CHANGES, STATUS_APPROVED)
 
+# Emojis för slutet av trådens titel
+STATUS_EMOJIS = {
+    STATUS_NEW: "🕒",
+    STATUS_CHANGES: "🔴",
+    STATUS_APPROVED: "✅"
+}
+
 FIELD_STATUS = "📌 Status"
 FIELD_VERSION = "🔢 Version"
 
@@ -114,7 +121,6 @@ FIELD_DEADLINE = "⏰ Deadline"
 
 try:
     from zoneinfo import ZoneInfo
-
     TZ = ZoneInfo("Europe/Stockholm")
 except Exception:  # tzdata saknas -> använd UTC
     TZ = timezone.utc
@@ -183,11 +189,12 @@ def find_status_tag(forum: discord.ForumChannel, status: str) -> discord.ForumTa
 
 
 async def set_thread_status(thread: discord.Thread, status: str) -> None:
-    """Byter statustagg på tråden (behåller kategori-taggen)."""
+    """Byter statustagg på tråden (behåller kategori-taggen) och uppdaterar titel-emojin."""
     forum = thread.parent
     if not isinstance(forum, discord.ForumChannel):
         return
 
+    # Hantera taggar
     status_names = {s.casefold() for s in ALL_STATUSES}
     keep = [t for t in thread.applied_tags if t.name.strip().casefold() not in status_names]
     new_tag = find_status_tag(forum, status)
@@ -195,9 +202,31 @@ async def set_thread_status(thread: discord.Thread, status: str) -> None:
         keep.append(new_tag)
     keep = keep[:5]  # Discord tillåter max 5 taggar per tråd
 
-    if new_tag is None and len(keep) == len(thread.applied_tags):
-        return  # Inget att ändra
-    await thread.edit(applied_tags=keep, archived=False)
+    # Hantera trådens namn (Titel-emoji)
+    current_name = thread.name
+    clean_name = current_name
+    for e in STATUS_EMOJIS.values():
+        if clean_name.endswith(e):
+            clean_name = clean_name[:-len(e)].strip()
+    
+    # Discord tillåter max 100 tecken, vi stannar vid 95 för säkerhets skull
+    new_name = f"{truncate(clean_name, 95)} {STATUS_EMOJIS.get(status, '')}"
+
+    # Skapa uppdateringen
+    edit_kwargs = {"archived": False}
+    if new_name != current_name:
+        edit_kwargs["name"] = new_name
+    
+    current_tag_ids = {t.id for t in thread.applied_tags}
+    new_tag_ids = {t.id for t in keep}
+    if current_tag_ids != new_tag_ids:
+        edit_kwargs["applied_tags"] = keep
+
+    if len(edit_kwargs) == 1 and "archived" in edit_kwargs:
+        if not thread.archived:
+            return  # Inget behöver ändras
+
+    await thread.edit(**edit_kwargs)
 
 
 async def get_thread(interaction: discord.Interaction) -> discord.Thread | None:
@@ -211,13 +240,42 @@ async def get_thread(interaction: discord.Interaction) -> discord.Thread | None:
     return channel if isinstance(channel, discord.Thread) else None
 
 
-async def safe_delete(message: discord.Message | None) -> None:
+async def safe_delete(message: discord.Message | None) -> bool:
+    """Raderar ett meddelande. Returnerar False om boten inte får (saknar Hantera meddelanden)."""
     if message is None:
-        return
+        return True
     try:
         await message.delete()
-    except (discord.Forbidden, discord.NotFound):
-        log.warning("Kunde inte radera meddelande (saknar Manage Messages?)")
+        return True
+    except discord.NotFound:
+        return True
+    except discord.Forbidden:
+        log.warning(
+            "Kunde inte radera meddelandet i kanal %s – boten saknar behörigheten 'Hantera meddelanden'.",
+            getattr(message.channel, "id", "?"),
+        )
+        return False
+
+
+async def followup_temp(
+    interaction: discord.Interaction, content: str, lifetime: float = EPHEMERAL_LIFETIME, **kwargs
+) -> None:
+    """
+    Skickar ett dolt uppföljningssvar som raderas av sig självt efter en stund.
+    (Webhook.send/followup.send saknar delete_after i discord.py – därför görs det här manuellt.)
+    """
+    msg = await interaction.followup.send(content, ephemeral=True, wait=True, **kwargs)
+
+    async def _later() -> None:
+        await asyncio.sleep(lifetime)
+        try:
+            await msg.delete()
+        except discord.HTTPException:
+            pass
+
+    task = asyncio.create_task(_later())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
 
 
 def filename_tip(filename: str) -> str:
@@ -240,6 +298,7 @@ class Collected:
     preview_name: str | None = None
     link: str | None = None
     data: bytes | None = None  # Filens bytes (bara för modellkoll)
+    modal: bool = False  # True när filen kom direkt från formuläret (ingen chatt)
 
 
 def add_file_fields(embed: discord.Embed, c: Collected) -> None:
@@ -251,6 +310,55 @@ def add_file_fields(embed: discord.Embed, c: Collected) -> None:
         embed.add_field(name="🔗 Länk", value=truncate(c.link, 1000), inline=False)
     if c.preview_name:
         embed.set_image(url=f"attachment://{c.preview_name}")
+
+
+async def build_collected(
+    interaction: discord.Interaction,
+    attachments: list[discord.Attachment],
+    message: discord.Message | None,
+) -> Collected | None:
+    """
+    Gemensam kontroll + nedladdning av bifogade filer (från chatt ELLER direkt från formuläret).
+    Returnerar None om något är fel (användaren har då fått ett dolt felmeddelande).
+    """
+    # Välj huvudfil och förhandsbild
+    non_images = [a for a in attachments if not is_image(a)]
+    main = non_images[0] if non_images else attachments[0]
+    preview = next((a for a in attachments if a is not main and is_image(a)), None)
+
+    # Kontrollera filtyp
+    if ALLOWED_EXTENSIONS is not None and ext_of(main.filename) not in ALLOWED_EXTENSIONS:
+        await safe_delete(message)
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        await followup_temp(interaction, f"❌ Filtypen `{ext_of(main.filename) or 'okänd'}` är inte tillåten.\n"
+            f"Tillåtna typer: {allowed}\n"
+            f"Tips: packa ihop i en `.zip` eller använd länkfältet.", EPHEMERAL_LIFETIME)
+        return None
+
+    # Kontrollera storlek mot serverns uppladdningsgräns (boten måste ladda upp filen igen)
+    limit = interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024
+    total = main.size + (preview.size if preview else 0)
+    if total > limit:
+        await safe_delete(message)
+        await followup_temp(interaction, f"❌ Filen är för stor för att jag ska kunna lägga den i forumet "
+            f"({total / 1024 / 1024:.1f} MB, gränsen är {limit / 1024 / 1024:.0f} MB).\n"
+            f"Ladda upp den på Google Drive / Dropbox och klistra in länken i "
+            f"länkfältet istället.", EPHEMERAL_LIFETIME)
+        return None
+
+    # Ladda ner filerna INNAN originalmeddelandet raderas
+    collected = Collected(message=message, attachment=main)
+    collected.files.append(await main.to_file())
+    if (
+        ext_of(main.filename) in (ANALYZABLE_EXTENSIONS | {".zip"})
+        and main.size <= ANALYZE_MAX_BYTES
+    ):
+        collected.data = collected.files[0].fp.getvalue()
+    if preview is not None:
+        preview_name = f"preview{ext_of(preview.filename) or '.png'}"
+        collected.files.append(await preview.to_file(filename=preview_name))
+        collected.preview_name = preview_name
+    return collected
 
 
 async def collect_upload(interaction: discord.Interaction, link: str | None) -> Collected | None:
@@ -291,60 +399,37 @@ async def collect_upload(interaction: discord.Interaction, link: str | None) -> 
             "message", check=check, timeout=UPLOAD_TIMEOUT_SECONDS
         )
     except asyncio.TimeoutError:
-        await interaction.followup.send(
-            "⏰ Tiden gick ut – ingen fil bifogades. Klicka på knappen och försök igen.",
-            ephemeral=True,
-            delete_after=EPHEMERAL_LIFETIME,
-        )
+        await followup_temp(interaction, "⏰ Tiden gick ut – ingen fil bifogades. Klicka på knappen och försök igen.", EPHEMERAL_LIFETIME)
         return None
 
-    # Välj huvudfil och förhandsbild
-    attachments = message.attachments
-    non_images = [a for a in attachments if not is_image(a)]
-    main = non_images[0] if non_images else attachments[0]
-    preview = next((a for a in attachments if a is not main and is_image(a)), None)
+    return await build_collected(interaction, message.attachments, message)
 
-    # Kontrollera filtyp
-    if ALLOWED_EXTENSIONS is not None and ext_of(main.filename) not in ALLOWED_EXTENSIONS:
-        await safe_delete(message)
-        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
-        await interaction.followup.send(
-            f"❌ Filtypen `{ext_of(main.filename) or 'okänd'}` är inte tillåten.\n"
-            f"Tillåtna typer: {allowed}\n"
-            f"Tips: packa ihop i en `.zip` eller använd länkfältet.",
-            ephemeral=True,
-            delete_after=EPHEMERAL_LIFETIME,
-        )
-        return None
 
-    # Kontrollera storlek mot serverns uppladdningsgräns (boten måste ladda upp filen igen)
-    limit = interaction.guild.filesize_limit if interaction.guild else 10 * 1024 * 1024
-    total = main.size + (preview.size if preview else 0)
-    if total > limit:
-        await safe_delete(message)
-        await interaction.followup.send(
-            f"❌ Filen är för stor för att jag ska kunna lägga den i forumet "
-            f"({total / 1024 / 1024:.1f} MB, gränsen är {limit / 1024 / 1024:.0f} MB).\n"
-            f"Ladda upp den på Google Drive / Dropbox och klistra in länken i "
-            f"länkfältet istället.",
-            ephemeral=True,
-            delete_after=EPHEMERAL_LIFETIME,
-        )
-        return None
+def schedule_delete_original(interaction: discord.Interaction, delay: float) -> None:
+    """Raderar interaktionens dolda svar efter en stund (formulär-flödet använder defer)."""
 
-    # Ladda ner filerna INNAN originalmeddelandet raderas
-    collected = Collected(message=message, attachment=main)
-    collected.files.append(await main.to_file())
-    if (
-        ext_of(main.filename) in (ANALYZABLE_EXTENSIONS | {".zip"})
-        and main.size <= ANALYZE_MAX_BYTES
-    ):
-        collected.data = collected.files[0].fp.getvalue()
-    if preview is not None:
-        preview_name = f"preview{ext_of(preview.filename) or '.png'}"
-        collected.files.append(await preview.to_file(filename=preview_name))
-        collected.preview_name = preview_name
-    return collected
+    async def _later() -> None:
+        await asyncio.sleep(delay)
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+
+    task = asyncio.create_task(_later())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+
+
+async def send_result(interaction: discord.Interaction, text: str, modal: bool) -> None:
+    """Skickar sista dolda meddelandet (fungerar både efter defer och efter vanligt svar)."""
+    if modal:
+        try:
+            await interaction.edit_original_response(content=text)
+            schedule_delete_original(interaction, EPHEMERAL_LIFETIME)
+            return
+        except discord.HTTPException:
+            pass
+    await followup_temp(interaction, text, EPHEMERAL_LIFETIME)
 
 
 async def finish_prompt(interaction: discord.Interaction) -> None:
@@ -353,6 +438,99 @@ async def finish_prompt(interaction: discord.Interaction) -> None:
         await interaction.delete_original_response()
     except discord.HTTPException:
         pass
+
+
+DELETE_WARNING = (
+    "\n⚠️ Jag kunde inte radera ditt filmeddelande i kanalen. "
+    "Ge mig behörigheten **Hantera meddelanden** där så städar jag automatiskt."
+)
+
+
+async def publish_new_post(
+    interaction: discord.Interaction,
+    c: Collected,
+    title: str,
+    description: str,
+    category: str,
+    tag_id: int | None,
+) -> None:
+    bot = interaction.client
+    user = interaction.user
+
+    forum = bot.get_channel(FORUM_CHANNEL_ID)
+    if forum is None:
+        forum = await bot.fetch_channel(FORUM_CHANNEL_ID)
+    if not isinstance(forum, discord.ForumChannel):
+        await followup_temp(interaction, "❌ Kanalen med det angivna ID:t är inte en Forum-kanal.", EPHEMERAL_LIFETIME)
+        return
+
+    embed = discord.Embed(
+        title=truncate(title, 256),
+        description=truncate(description, 4000) if description else None,
+        color=COLOR_NEW,
+        timestamp=discord.utils.utcnow(),
+    )
+    # Författar-URL används för att kunna pinga uppladdaren vid statusändring
+    embed.set_author(
+        name=user.display_name,
+        icon_url=user.display_avatar.url,
+        url=f"https://discord.com/users/{user.id}",
+    )
+    embed.add_field(name="📂 Kategori", value=truncate(category, 1024), inline=True)
+    add_file_fields(embed, c)
+    embed.add_field(name=FIELD_STATUS, value=f"🆕 {STATUS_NEW}", inline=True)
+    embed.add_field(name=FIELD_VERSION, value="v1", inline=True)
+    embed.set_footer(text=f"Uppladdad av {user.display_name}")
+
+    tag = forum.get_tag(tag_id) if tag_id is not None else None
+    applied: list[discord.ForumTag] = []
+    if tag is not None:
+        applied.append(tag)
+    status_tag = find_status_tag(forum, STATUS_NEW)
+    if status_tag is not None:
+        applied.append(status_tag)
+
+    kwargs = {}
+    if applied:
+        kwargs["applied_tags"] = applied
+    if c.files:
+        kwargs["files"] = c.files
+
+    # Sätt trådens namn direkt med den första emojin (Klockan)
+    base_name = f"[{category}] {title}"
+    thread_name = f"{truncate(base_name, 95)} {STATUS_EMOJIS[STATUS_NEW]}"
+
+    created = await forum.create_thread(
+        name=thread_name,
+        content="@everyone",
+        embed=embed,
+        view=ThreadView(),
+        allowed_mentions=discord.AllowedMentions(everyone=True),
+        **kwargs,
+    )
+    thread = created.thread
+
+    if c.attachment is not None and is_viewable(c.attachment.filename):
+        url = viewer_url(thread.id)
+        if url:
+            try:
+                await created.message.edit(view=ThreadView(viewer_url=url))
+            except discord.HTTPException:
+                log.exception("Kunde inte lägga till 3D-knappen")
+
+    deleted = await safe_delete(c.message)
+    if not c.modal:
+        await finish_prompt(interaction)
+    bot.request_refresh()
+    schedule_model_check(bot, thread, c, user.id, category)
+
+    tip = filename_tip(c.attachment.filename) if c.attachment else ""
+    warn = "" if deleted else DELETE_WARNING
+    await send_result(
+        interaction,
+        f"✅ Din fil har laddats upp!\n🏷️ Kategori: **{category}**{tip}{warn}\n{thread.jump_url}",
+        c.modal,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -404,100 +582,96 @@ class UploadModal(discord.ui.Modal, title="Ladda upp fil"):
             await self._publish(interaction, collected)
         except Exception:
             log.exception("Fel vid uppladdning till forumet")
-            await interaction.followup.send(
-                "❌ Något gick fel när filen skulle postas i forumet. "
-                "Kontrollera mina behörigheter och försök igen.",
-                ephemeral=True,
-                delete_after=EPHEMERAL_LIFETIME,
-            )
+            await followup_temp(interaction, "❌ Något gick fel när filen skulle postas i forumet. "
+                "Kontrollera mina behörigheter och försök igen.", EPHEMERAL_LIFETIME)
 
     async def _publish(self, interaction: discord.Interaction, c: Collected) -> None:
-        bot = interaction.client
-        title = self.title_input.value.strip()
-        description = (self.description_input.value or "").strip()
-        category = self.category
-        user = interaction.user
-
-        forum = bot.get_channel(FORUM_CHANNEL_ID)
-        if forum is None:
-            forum = await bot.fetch_channel(FORUM_CHANNEL_ID)
-        if not isinstance(forum, discord.ForumChannel):
-            await interaction.followup.send(
-                "❌ Kanalen med det angivna ID:t är inte en Forum-kanal.",
-                ephemeral=True,
-                delete_after=EPHEMERAL_LIFETIME,
-            )
-            return
-
-        embed = discord.Embed(
-            title=truncate(title, 256),
-            description=truncate(description, 4000) if description else None,
-            color=COLOR_NEW,
-            timestamp=discord.utils.utcnow(),
-        )
-        # Författar-URL används för att kunna pinga uppladdaren vid statusändring
-        embed.set_author(
-            name=user.display_name,
-            icon_url=user.display_avatar.url,
-            url=f"https://discord.com/users/{user.id}",
-        )
-        embed.add_field(name="📂 Kategori", value=truncate(category, 1024), inline=True)
-        add_file_fields(embed, c)
-        embed.add_field(name=FIELD_STATUS, value=f"🆕 {STATUS_NEW}", inline=True)
-        embed.add_field(name=FIELD_VERSION, value="v1", inline=True)
-        embed.set_footer(text=f"Uppladdad av {user.display_name}")
-
-        tag = forum.get_tag(self.tag_id) if self.tag_id is not None else None
-        applied: list[discord.ForumTag] = []
-        if tag is not None:
-            applied.append(tag)
-        status_tag = find_status_tag(forum, STATUS_NEW)
-        if status_tag is not None:
-            applied.append(status_tag)
-
-        kwargs = {}
-        if applied:
-            kwargs["applied_tags"] = applied
-        if c.files:
-            kwargs["files"] = c.files
-
-        created = await forum.create_thread(
-            name=truncate(f"[{category}] {title}", 100),
-            content="@everyone",
-            embed=embed,
-            view=ThreadView(),
-            allowed_mentions=discord.AllowedMentions(everyone=True),
-            **kwargs,
-        )
-        thread = created.thread
-
-        if c.attachment is not None and is_viewable(c.attachment.filename):
-            url = viewer_url(thread.id)
-            if url:
-                try:
-                    await created.message.edit(view=ThreadView(viewer_url=url))
-                except discord.HTTPException:
-                    log.exception("Kunde inte lägga till 3D-knappen")
-
-        await safe_delete(c.message)
-        await finish_prompt(interaction)
-        bot.request_refresh()
-        schedule_model_check(bot, thread, c, user.id, category)
-
-        tip = filename_tip(c.attachment.filename) if c.attachment else ""
-        await interaction.followup.send(
-            f"✅ Din fil har laddats upp!\n🏷️ Kategori: **{category}**{tip}\n{thread.jump_url}",
-            ephemeral=True,
-            delete_after=EPHEMERAL_LIFETIME,
+        await publish_new_post(
+            interaction,
+            c,
+            self.title_input.value.strip(),
+            (self.description_input.value or "").strip(),
+            self.category,
+            self.tag_id,
         )
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         log.exception("Modal-fel", exc_info=error)
         msg = "❌ Ett oväntat fel inträffade."
         if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
+            await followup_temp(interaction, msg, EPHEMERAL_LIFETIME)
         else:
             await interaction.response.send_message(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
+
+
+async def publish_new_version(
+    interaction: discord.Interaction,
+    thread: discord.Thread,
+    c: Collected,
+    notes: str,
+) -> None:
+    user = interaction.user
+
+    starter = await thread.fetch_message(thread.id)
+    starter_embed = starter.embeds[0].copy() if starter.embeds else None
+    version = current_version(starter_embed) + 1 if starter_embed else 2
+
+    embed = discord.Embed(
+        title=f"🔄 Ny version: v{version}",
+        description=truncate(notes, 4000) if notes else None,
+        color=COLOR_NEW,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
+    add_file_fields(embed, c)
+    embed.set_footer(text=f"Uppladdad av {user.display_name}")
+
+    kwargs = {}
+    if c.files:
+        kwargs["files"] = c.files
+    version_msg = await thread.send(
+        content=NEW_VERSION_PING or None,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(everyone=bool(NEW_VERSION_PING)),
+        **kwargs,
+    )
+
+    viewable = c.attachment is not None and is_viewable(c.attachment.filename)
+    if viewable and viewer_url(thread.id, version_msg.id):
+        try:
+            await version_msg.edit(view=make_viewer_view(viewer_url(thread.id, version_msg.id)))
+        except discord.HTTPException:
+            log.exception("Kunde inte lägga till 3D-knappen på versionen")
+
+    # Uppdatera startmeddelandet: version, länk till senaste filen och status
+    if starter_embed is not None:
+        set_field(starter_embed, FIELD_VERSION, f"v{version} · [Visa filen]({version_msg.jump_url})")
+        set_field(starter_embed, FIELD_STATUS, f"🆕 {STATUS_NEW}")
+        starter_embed.color = COLOR_NEW
+        start_url = viewer_url(thread.id) if viewable else None
+        if start_url:
+            await starter.edit(embed=starter_embed, view=ThreadView(viewer_url=start_url))
+        else:
+            await starter.edit(embed=starter_embed)
+    
+    await set_thread_status(thread, STATUS_NEW)
+
+    deleted = await safe_delete(c.message)
+    if not c.modal:
+        await finish_prompt(interaction)
+    interaction.client.request_refresh()
+    category = ""
+    if starter_embed is not None:
+        category = next((f.value for f in starter_embed.fields if f.name == "📂 Kategori"), "")
+    schedule_model_check(interaction.client, thread, c, user.id, category)
+
+    tip = filename_tip(c.attachment.filename) if c.attachment else ""
+    warn = "" if deleted else DELETE_WARNING
+    await send_result(
+        interaction,
+        f"✅ Version **v{version}** är uppladdad!{tip}{warn}\n{version_msg.jump_url}",
+        c.modal,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -552,81 +726,258 @@ class VersionModal(discord.ui.Modal, title="Ny version"):
             await self._publish(interaction, thread, collected)
         except Exception:
             log.exception("Fel vid ny version")
-            await interaction.followup.send(
-                "❌ Något gick fel när den nya versionen skulle postas.",
-                ephemeral=True,
-                delete_after=EPHEMERAL_LIFETIME,
-            )
+            await followup_temp(interaction, "❌ Något gick fel när den nya versionen skulle postas.", EPHEMERAL_LIFETIME)
 
     async def _publish(self, interaction: discord.Interaction, thread: discord.Thread, c: Collected) -> None:
-        user = interaction.user
-        notes = (self.notes_input.value or "").strip()
-
-        starter = await thread.fetch_message(thread.id)
-        starter_embed = starter.embeds[0].copy() if starter.embeds else None
-        version = current_version(starter_embed) + 1 if starter_embed else 2
-
-        embed = discord.Embed(
-            title=f"🔄 Ny version: v{version}",
-            description=truncate(notes, 4000) if notes else None,
-            color=COLOR_NEW,
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
-        add_file_fields(embed, c)
-        embed.set_footer(text=f"Uppladdad av {user.display_name}")
-
-        kwargs = {}
-        if c.files:
-            kwargs["files"] = c.files
-        version_msg = await thread.send(
-            content=NEW_VERSION_PING or None,
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions(everyone=bool(NEW_VERSION_PING)),
-            **kwargs,
-        )
-
-        viewable = c.attachment is not None and is_viewable(c.attachment.filename)
-        if viewable and viewer_url(thread.id, version_msg.id):
-            try:
-                await version_msg.edit(view=make_viewer_view(viewer_url(thread.id, version_msg.id)))
-            except discord.HTTPException:
-                log.exception("Kunde inte lägga till 3D-knappen på versionen")
-
-        # Uppdatera startmeddelandet: version, länk till senaste filen och status
-        if starter_embed is not None:
-            set_field(starter_embed, FIELD_VERSION, f"v{version} · [Visa filen]({version_msg.jump_url})")
-            set_field(starter_embed, FIELD_STATUS, f"🆕 {STATUS_NEW}")
-            starter_embed.color = COLOR_NEW
-            start_url = viewer_url(thread.id) if viewable else None
-            if start_url:
-                await starter.edit(embed=starter_embed, view=ThreadView(viewer_url=start_url))
-            else:
-                await starter.edit(embed=starter_embed)
-        await set_thread_status(thread, STATUS_NEW)
-
-        await safe_delete(c.message)
-        await finish_prompt(interaction)
-        interaction.client.request_refresh()
-        category = ""
-        if starter_embed is not None:
-            category = next((f.value for f in starter_embed.fields if f.name == "📂 Kategori"), "")
-        schedule_model_check(interaction.client, thread, c, user.id, category)
-
-        tip = filename_tip(c.attachment.filename) if c.attachment else ""
-        await interaction.followup.send(
-            f"✅ Version **v{version}** är uppladdad!{tip}\n{version_msg.jump_url}",
-            ephemeral=True,
-            delete_after=EPHEMERAL_LIFETIME,
-        )
+        await publish_new_version(interaction, thread, c, (self.notes_input.value or "").strip())
 
     async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
         log.exception("Modal-fel (version)", exc_info=error)
         msg = "❌ Ett oväntat fel inträffade."
         if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
+            await followup_temp(interaction, msg, EPHEMERAL_LIFETIME)
         else:
             await interaction.response.send_message(msg, ephemeral=True, delete_after=EPHEMERAL_LIFETIME)
+
+# --------------------------------------------------------------------------- #
+# Modal: Behöver ändras
+# --------------------------------------------------------------------------- #
+class ChangesModal(discord.ui.Modal, title="Vad behöver ändras?"):
+    reason_input = discord.ui.TextInput(
+        label="Beskrivning av ändringar",
+        placeholder="T.ex. fixa texturerna, modellen är för stor...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=1500,
+    )
+
+    def __init__(self, view: "ThreadView") -> None:
+        super().__init__()
+        self.thread_view = view
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        # Skickar vidare texten till status-funktionen
+        await self.thread_view._change_status(
+            interaction, 
+            STATUS_CHANGES, 
+            "🛠️", 
+            COLOR_CHANGES, 
+            reason=self.reason_input.value
+        )
+
+# --------------------------------------------------------------------------- #
+# Formulär med inbyggd filuppladdning (ingen fil i chatten!)
+# --------------------------------------------------------------------------- #
+def modal_upload_supported() -> bool:
+    """Kräver ny discord.py med Label + FileUpload i modaler."""
+    return hasattr(discord.ui, "Label") and hasattr(discord.ui, "FileUpload")
+
+
+MODAL_UPLOAD = modal_upload_supported()
+
+
+def category_options(forum: discord.ForumChannel | None) -> list[discord.SelectOption]:
+    status_names = {s.casefold() for s in ALL_STATUSES}
+    options: list[discord.SelectOption] = []
+    if forum is not None:
+        tags = [t for t in forum.available_tags if t.name.strip().casefold() not in status_names]
+        for tag in tags[:25]:  # Discord tillåter max 25 alternativ
+            options.append(
+                discord.SelectOption(label=truncate(tag.name, 100), value=str(tag.id), emoji=tag.emoji)
+            )
+    if not options:
+        for name in FALLBACK_CATEGORIES:
+            options.append(discord.SelectOption(label=name, value=f"name:{name}"))
+    return options
+
+
+async def reply_error(interaction: discord.Interaction, text: str) -> None:
+    """Felmeddelande efter defer (ersätter 'tänker ...'-meddelandet)."""
+    try:
+        await interaction.edit_original_response(content=text)
+        schedule_delete_original(interaction, EPHEMERAL_LIFETIME)
+    except discord.HTTPException:
+        await followup_temp(interaction, text, EPHEMERAL_LIFETIME)
+
+
+class UploadModalV2(discord.ui.Modal, title="Ladda upp fil"):
+    """Allt i ett formulär: titel, kategori, beskrivning, fil (+ bild) och valfri länk."""
+
+    def __init__(self, forum: discord.ForumChannel | None) -> None:
+        super().__init__()
+        self.title_input = discord.ui.TextInput(
+            placeholder="T.ex. BMW M3 E46",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=80,
+        )
+        self.category_select = discord.ui.Select(
+            placeholder="Välj kategori ...",
+            options=category_options(forum),
+            min_values=1,
+            max_values=1,
+            required=True,
+        )
+        self.description_input = discord.ui.TextInput(
+            placeholder="Berätta lite om projektet ...",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=1500,
+        )
+        self.file_upload = discord.ui.FileUpload(required=False, min_values=0, max_values=2)
+        self.link_input = discord.ui.TextInput(
+            placeholder="Drive / Dropbox – bara om filen är för stor",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=300,
+        )
+        self.add_item(discord.ui.Label(text="Titel / Namn", component=self.title_input))
+        self.add_item(discord.ui.Label(text="Kategori", component=self.category_select))
+        self.add_item(discord.ui.Label(text="Beskrivning (valfritt)", component=self.description_input))
+        self.add_item(
+            discord.ui.Label(
+                text="Fil + förhandsbild (valfritt)",
+                description="Max 2 filer: modellen och gärna en bild på den",
+                component=self.file_upload,
+            )
+        )
+        self.add_item(discord.ui.Label(text="Länk (om filen är för stor)", component=self.link_input))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        link = (self.link_input.value or "").strip()
+        attachments = list(self.file_upload.values)
+        if link and not valid_link(link):
+            await reply_error(interaction, "❌ Länken måste börja med http:// eller https://")
+            return
+        if not attachments and not link:
+            await reply_error(interaction, "❌ Bifoga en fil i formuläret eller ange en länk. Försök igen.")
+            return
+
+        value = self.category_select.values[0]
+        label = next((o.label for o in self.category_select.options if o.value == value), value)
+        tag_id = None if value.startswith("name:") else int(value)
+
+        if attachments:
+            collected = await build_collected(interaction, attachments, None)
+            if collected is None:
+                return
+        else:
+            collected = Collected(link=link)
+        collected.modal = True
+
+        try:
+            await publish_new_post(
+                interaction,
+                collected,
+                self.title_input.value.strip(),
+                (self.description_input.value or "").strip(),
+                label,
+                tag_id,
+            )
+        except Exception:
+            log.exception("Fel vid uppladdning till forumet")
+            await reply_error(
+                interaction,
+                "❌ Något gick fel när filen skulle postas i forumet. "
+                "Kontrollera mina behörigheter och försök igen.",
+            )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Modal-fel (formulär)", exc_info=error)
+        if interaction.response.is_done():
+            await reply_error(interaction, "❌ Ett oväntat fel inträffade.")
+        else:
+            await interaction.response.send_message(
+                "❌ Ett oväntat fel inträffade.", ephemeral=True, delete_after=EPHEMERAL_LIFETIME
+            )
+
+
+class VersionModalV2(discord.ui.Modal, title="Ny version"):
+    """Ny version: ändringsnotis, fil (+ bild) och valfri länk i samma formulär."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.notes_input = discord.ui.TextInput(
+            placeholder="T.ex. fixade UV:erna, lade till texturer ...",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=1500,
+        )
+        self.file_upload = discord.ui.FileUpload(required=False, min_values=0, max_values=2)
+        self.link_input = discord.ui.TextInput(
+            placeholder="Drive / Dropbox – bara om filen är för stor",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=300,
+        )
+        self.add_item(discord.ui.Label(text="Vad har ändrats? (valfritt)", component=self.notes_input))
+        self.add_item(
+            discord.ui.Label(
+                text="Fil + förhandsbild",
+                description="Max 2 filer: modellen och gärna en bild på den",
+                component=self.file_upload,
+            )
+        )
+        self.add_item(discord.ui.Label(text="Länk (om filen är för stor)", component=self.link_input))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        link = (self.link_input.value or "").strip()
+        attachments = list(self.file_upload.values)
+        if link and not valid_link(link):
+            await reply_error(interaction, "❌ Länken måste börja med http:// eller https://")
+            return
+        if not attachments and not link:
+            await reply_error(interaction, "❌ Bifoga en fil i formuläret eller ange en länk. Försök igen.")
+            return
+
+        thread = await get_thread(interaction)
+        if thread is None:
+            await reply_error(interaction, "❌ Knappen måste användas inne i en forumtråd.")
+            return
+
+        if attachments:
+            collected = await build_collected(interaction, attachments, None)
+            if collected is None:
+                return
+        else:
+            collected = Collected(link=link)
+        collected.modal = True
+
+        try:
+            await publish_new_version(interaction, thread, collected, (self.notes_input.value or "").strip())
+        except Exception:
+            log.exception("Fel vid ny version")
+            await reply_error(interaction, "❌ Något gick fel när den nya versionen skulle postas.")
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Modal-fel (ny version, formulär)", exc_info=error)
+        if interaction.response.is_done():
+            await reply_error(interaction, "❌ Ett oväntat fel inträffade.")
+        else:
+            await interaction.response.send_message(
+                "❌ Ett oväntat fel inträffade.", ephemeral=True, delete_after=EPHEMERAL_LIFETIME
+            )
+
+
+async def try_send_modal_v2(interaction: discord.Interaction, build) -> bool:
+    """Försöker öppna formuläret med filuppladdning. Returnerar False om det inte går (då används gamla flödet)."""
+    global MODAL_UPLOAD
+    if not MODAL_UPLOAD:
+        return False
+    try:
+        await interaction.response.send_modal(build())
+        return True
+    except Exception:
+        MODAL_UPLOAD = False  # Stäng av så ingen drabbas igen – gamla flödet tar över
+        log.exception(
+            "Formuläret med filuppladdning fungerade inte – faller tillbaka på chatt-uppladdning. "
+            "Uppdatera discord.py (pip install -U discord.py)."
+        )
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -654,6 +1005,8 @@ class ThreadView(discord.ui.View):
     async def new_version_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        if await try_send_modal_v2(interaction, VersionModalV2):
+            return
         await interaction.response.send_modal(VersionModal())
 
     @discord.ui.button(
@@ -676,7 +1029,7 @@ class ThreadView(discord.ui.View):
     async def changes_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        await self._change_status(interaction, STATUS_CHANGES, "🛠️", COLOR_CHANGES)
+        await interaction.response.send_modal(ChangesModal(self))
 
     async def _change_status(
         self,
@@ -684,20 +1037,27 @@ class ThreadView(discord.ui.View):
         status: str,
         emoji: str,
         color: discord.Color,
+        reason: str | None = None
     ) -> None:
         message = interaction.message
         if message is None or not message.embeds:
-            await interaction.response.send_message(
-                "❌ Hittar inget inlägg att uppdatera.",
-                ephemeral=True,
-                delete_after=EPHEMERAL_LIFETIME,
-            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    "❌ Hittar inget inlägg att uppdatera.",
+                    ephemeral=True,
+                    delete_after=EPHEMERAL_LIFETIME,
+                )
             return
 
         embed = message.embeds[0].copy()
         set_field(embed, FIELD_STATUS, f"{emoji} {status}")
         embed.color = color
-        await interaction.response.edit_message(embed=embed)
+        
+        if interaction.response.is_done():
+            await interaction.followup.edit_message(message.id, embed=embed)
+        else:
+            await interaction.response.edit_message(embed=embed)
+            
         interaction.client.request_refresh()
 
         thread = await get_thread(interaction)
@@ -707,15 +1067,21 @@ class ThreadView(discord.ui.View):
         try:
             await set_thread_status(thread, status)
         except discord.HTTPException:
-            log.exception("Kunde inte byta statustagg")
+            log.exception("Kunde inte byta statustagg eller uppdatera namnet")
 
         # Meddela i tråden och pinga uppladdaren (om det inte är hen själv)
         uid = uploader_id(embed)
         text = f"{emoji} **{status}** – satt av {interaction.user.mention}"
+        
+        # Om det finns en "behöver ändras"-kommentar
+        if reason:
+            text += f"\n📝 **Kommentar:** {reason}"
+            
         mentions = discord.AllowedMentions.none()
         if uid and uid != interaction.user.id:
             text += f"\n<@{uid}>"
             mentions = discord.AllowedMentions(users=[discord.Object(id=uid)])
+            
         await thread.send(text, allowed_mentions=mentions)
 
 
@@ -780,15 +1146,29 @@ class UploadView(discord.ui.View):
     async def upload_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        # Nytt flöde: allt i ett formulär, filen laddas upp direkt i formuläret (inget chattmeddelande)
+        cached_forum = interaction.client.get_channel(FORUM_CHANNEL_ID)
+        if await try_send_modal_v2(
+            interaction,
+            lambda: UploadModalV2(cached_forum if isinstance(cached_forum, discord.ForumChannel) else None),
+        ):
+            return
+
+        # Gammalt flöde (om discord.py är för gammal): välj kategori -> formulär -> bifoga i chatten
+        # Säkerhet så boten hinner hämta kategorier utan att dö i Discord (15 min timer)
+        await interaction.response.defer(ephemeral=True)
+        
         forum = interaction.client.get_channel(FORUM_CHANNEL_ID)
         if not isinstance(forum, discord.ForumChannel):
-            forum = None
+            try:
+                forum = await interaction.client.fetch_channel(FORUM_CHANNEL_ID)
+            except discord.HTTPException:
+                forum = None
 
-        await interaction.response.send_message(
+        await followup_temp(
+            interaction,
             "📂 Välj vilken **kategori** din fil tillhör:",
             view=CategoryView(forum),
-            ephemeral=True,
-            delete_after=EPHEMERAL_LIFETIME,
         )
 
 
@@ -796,19 +1176,33 @@ class UploadView(discord.ui.View):
 # Uppladdningspanel (embed + knapp)
 # --------------------------------------------------------------------------- #
 def build_panel_embed() -> discord.Embed:
-    embed = discord.Embed(
-        title=PANEL_TITLE,
-        description=(
-            "Klicka på knappen nedan för att ladda upp en fil "
-            "(.blend, .fbx, .obj, .unitypackage m.fl.) till forumet.\n\n"
+    if MODAL_UPLOAD:
+        steps = (
+            "**Så här gör du:**\n"
+            "1️⃣ Tryck på **Ladda upp fil**\n"
+            "2️⃣ Fyll i formuläret: titel, kategori och beskrivning\n"
+            "3️⃣ Lägg filen direkt i formuläret – gärna en förhandsbild också 🖼️ "
+            "(eller en länk om filen är stor)\n"
+            "4️⃣ Skicka! Boten postar den i forumet åt dig ✨\n\n"
+            "Inget behöver skickas i chatten – allt sker i formuläret."
+        )
+    else:
+        steps = (
             "**Så här gör du:**\n"
             "1️⃣ Tryck på **Ladda upp fil**\n"
             "2️⃣ Välj kategori i listan\n"
             "3️⃣ Fyll i titel och beskrivning (eller en länk om filen är stor)\n"
             "4️⃣ Bifoga filen i chatten inom 2 minuter – lägg gärna med en "
             "förhandsbild i samma meddelande 🖼️\n"
-            "5️⃣ Klart! Boten postar den i forumet åt dig ✨\n\n"
-            "I varje forumtråd finns knappar för **ny version**, **godkänn** "
+            "5️⃣ Klart! Boten postar den i forumet åt dig ✨"
+        )
+    embed = discord.Embed(
+        title=PANEL_TITLE,
+        description=(
+            "Klicka på knappen nedan för att ladda upp en fil "
+            "(.blend, .fbx, .obj, .unitypackage m.fl.) till forumet.\n\n"
+            + steps
+            + "\n\nI varje forumtråd finns knappar för **ny version**, **godkänn** "
             "och **behöver ändras**."
         ),
         color=COLOR_NEW,
@@ -826,7 +1220,16 @@ async def ensure_panel(bot: "FileBot", channel_id: int, title: str, build_embed,
 
     async for msg in channel.history(limit=100):
         if msg.author.id == bot.user.id and msg.embeds and msg.embeds[0].title == title:
-            log.info("Panelen '%s' finns redan.", title)
+            # Håll panelen uppdaterad (t.ex. när uppladdningsflödet ändrats)
+            new_embed = build_embed()
+            if msg.embeds[0].description != new_embed.description:
+                try:
+                    await msg.edit(embed=new_embed, view=build_view())
+                    log.info("Panelen '%s' uppdaterades.", title)
+                except discord.HTTPException:
+                    log.exception("Kunde inte uppdatera panelen '%s'", title)
+            else:
+                log.info("Panelen '%s' finns redan.", title)
             return
 
     await channel.send(embed=build_embed(), view=build_view())
@@ -975,7 +1378,7 @@ class TaskModal(discord.ui.Modal, title="Ny uppgift"):
         log.exception("Modal-fel (uppgift)", exc_info=error)
         msg = "❌ Ett oväntat fel inträffade."
         if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True, delete_after=QUICK_LIFETIME)
+            await followup_temp(interaction, msg, QUICK_LIFETIME)
         else:
             await interaction.response.send_message(msg, ephemeral=True, delete_after=QUICK_LIFETIME)
 
@@ -2555,6 +2958,10 @@ class FileBot(commands.Bot):
         self._refresh_pending = False
 
     async def setup_hook(self) -> None:
+        log.info(
+            "Uppladdning direkt i formulär (fil i modal): %s",
+            "PÅ" if MODAL_UPLOAD else "AV – uppdatera discord.py för att slå på den",
+        )
         # Registrera permanenta knappar så de fungerar efter omstart
         self.add_view(UploadView())
         self.add_view(ThreadView())
