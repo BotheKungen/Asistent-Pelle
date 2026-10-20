@@ -35,10 +35,13 @@ import json
 import logging
 import math
 import os
+import queue
+import random
 import re
 import struct
 import sys
 import threading
+import time
 import zipfile
 import zlib
 from dataclasses import dataclass, field
@@ -637,11 +640,17 @@ async def publish_new_version(
     )
 
     viewable = c.attachment is not None and is_viewable(c.attachment.filename)
-    if viewable and viewer_url(thread.id, version_msg.id):
-        try:
-            await version_msg.edit(view=make_viewer_view(viewer_url(thread.id, version_msg.id)))
-        except discord.HTTPException:
-            log.exception("Kunde inte lägga till 3D-knappen på versionen")
+    version_url = viewer_url(thread.id, version_msg.id) if viewable else None
+    try:
+        # Det nya versionsmeddelandet får 🔄-knappen (+ 3D/Live) så den alltid ligger längst ner
+        await version_msg.edit(view=VersionMsgView(viewer_url=version_url))
+    except discord.HTTPException:
+        log.exception("Kunde inte lägga knapparna på versionen")
+    try:
+        # ...och äldre versionsmeddelanden slipper den (körs innan startmeddelandets versionsfält uppdateras)
+        await strip_old_version_buttons(interaction.client, thread, starter_embed, version_msg.id)
+    except discord.HTTPException:
+        log.exception("Kunde inte städa gamla versionsknappar")
 
     # Uppdatera startmeddelandet: version, länk till senaste filen och status
     if starter_embed is not None:
@@ -980,6 +989,94 @@ async def try_send_modal_v2(interaction: discord.Interaction, build) -> bool:
         return False
 
 
+NEW_VERSION_CUSTOM_ID = "filbot:new_version"
+
+
+def add_viewer_links(view: discord.ui.View, url: str) -> None:
+    """Lägger till länkknapparna 🔎 3D-vy och 👥 Live på en view."""
+    view.add_item(discord.ui.Button(label="Öppna 3D-vy", emoji="🔎", style=discord.ButtonStyle.link, url=url))
+    view.add_item(discord.ui.Button(label="Live", emoji="👥", style=discord.ButtonStyle.link, url=live_link(url)))
+
+
+async def open_version_modal(interaction: discord.Interaction) -> None:
+    if await try_send_modal_v2(interaction, VersionModalV2):
+        return
+    await interaction.response.send_modal(VersionModal())
+
+
+class VersionMsgView(discord.ui.View):
+    """
+    Knappar på VARJE versionsmeddelande: 🔄 Ladda upp ny version (+ 3D-vy och Live).
+    Det senaste versionsmeddelandet ligger alltid längst ner i tråden, så man slipper scrolla upp.
+    När en nyare version laddas upp tas 🔄-knappen bort från de äldre (se strip_old_version_buttons).
+    """
+
+    def __init__(self, viewer_url: str | None = None) -> None:
+        super().__init__(timeout=None)
+        if viewer_url:
+            add_viewer_links(self, viewer_url)
+
+    @discord.ui.button(
+        label="Ladda upp ny version",
+        style=discord.ButtonStyle.primary,
+        emoji="🔄",
+        custom_id=NEW_VERSION_CUSTOM_ID,
+    )
+    async def new_version_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await open_version_modal(interaction)
+
+
+def _message_buttons(msg: discord.Message) -> list:
+    out = []
+    for row in msg.components or []:
+        for comp in getattr(row, "children", None) or []:
+            out.append(comp)
+    return out
+
+
+async def strip_old_version_buttons(
+    bot: "FileBot", thread: discord.Thread, starter_embed: discord.Embed | None, keep_id: int
+) -> None:
+    """Tar bort 🔄-knappen från tidigare versionsmeddelanden (länkknapparna 3D/Live behålls)."""
+    candidates: dict[int, discord.Message] = {}
+
+    # Föregående senaste version enligt startmeddelandets versionsfält
+    if starter_embed is not None:
+        for f in starter_embed.fields:
+            if f.name == FIELD_VERSION:
+                m = re.search(r"/channels/\d+/\d+/(\d+)", f.value or "")
+                if m and int(m.group(1)) not in (keep_id, thread.id):
+                    try:
+                        candidates[int(m.group(1))] = await thread.fetch_message(int(m.group(1)))
+                    except discord.HTTPException:
+                        pass
+
+    # Plus en svepning över de senaste meddelandena (om någon version missats)
+    async for msg in thread.history(limit=40):
+        if msg.id not in (keep_id, thread.id):
+            candidates.setdefault(msg.id, msg)
+
+    for msg in candidates.values():
+        if msg.author.id != bot.user.id:
+            continue
+        comps = _message_buttons(msg)
+        if not any(getattr(c, "custom_id", None) == NEW_VERSION_CUSTOM_ID for c in comps):
+            continue
+        view = discord.ui.View(timeout=None)
+        for c in comps:
+            url = getattr(c, "url", None)
+            if url:
+                view.add_item(
+                    discord.ui.Button(label=c.label, emoji=c.emoji, style=discord.ButtonStyle.link, url=url)
+                )
+        try:
+            await msg.edit(view=view if view.children else None)
+        except discord.HTTPException:
+            log.exception("Kunde inte ta bort gammal versionsknapp")
+
+
 # --------------------------------------------------------------------------- #
 # Knappar i forumtråden (permanent view)
 # --------------------------------------------------------------------------- #
@@ -987,27 +1084,18 @@ class ThreadView(discord.ui.View):
     def __init__(self, viewer_url: str | None = None) -> None:
         super().__init__(timeout=None)
         if viewer_url:
-            self.add_item(
-                discord.ui.Button(
-                    label="Öppna 3D-vy",
-                    emoji="🔎",
-                    style=discord.ButtonStyle.link,
-                    url=viewer_url,
-                )
-            )
+            add_viewer_links(self, viewer_url)
 
     @discord.ui.button(
         label="Ladda upp ny version",
         style=discord.ButtonStyle.primary,
         emoji="🔄",
-        custom_id="filbot:new_version",
+        custom_id=NEW_VERSION_CUSTOM_ID,
     )
     async def new_version_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        if await try_send_modal_v2(interaction, VersionModalV2):
-            return
-        await interaction.response.send_modal(VersionModal())
+        await open_version_modal(interaction)
 
     @discord.ui.button(
         label="Godkänn",
@@ -2400,6 +2488,21 @@ button.on{background:var(--accent);border-color:var(--accent)}
 .bar{width:min(320px,70vw);height:8px;background:#232733;border-radius:99px;overflow:hidden}
 .bar>i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s}
 .err{color:#ff7b7b;max-width:520px}
+.live{position:fixed;right:12px;top:calc(env(safe-area-inset-top,0px) + 64px);width:min(300px,88vw);background:var(--panel);border:1px solid #2c313c;border-radius:14px;padding:12px;font-size:13.5px;backdrop-filter:blur(8px);z-index:5}
+.live[hidden],.banner[hidden],.toast[hidden]{display:none}
+.live .lhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+.live p{color:var(--muted);margin-bottom:10px;line-height:1.4}
+.live input{width:100%;font:inherit;font-size:16px;color:var(--text);background:#0f1115;border:1px solid #2c313c;border-radius:10px;padding:10px;margin-bottom:8px}
+.live button{padding:8px 12px;font-size:13px}
+.live .primary{background:var(--accent);border-color:var(--accent);width:100%}
+.lbtns{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.peer{display:flex;align-items:center;gap:8px;padding:5px 0}
+.peer i{width:10px;height:10px;border-radius:50%;flex:none}
+.peer span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.peer button{padding:5px 9px;font-size:12px}
+.banner{position:fixed;left:50%;transform:translateX(-50%);top:calc(env(safe-area-inset-top,0px) + 58px);background:var(--accent);color:#fff;border-radius:99px;padding:6px 6px 6px 16px;font-size:13px;font-weight:600;display:flex;gap:10px;align-items:center;z-index:6;white-space:nowrap}
+.banner button{padding:5px 12px;font-size:12px;background:rgba(0,0,0,.28);border-color:transparent}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom,0px) + 78px);background:var(--panel);border:1px solid #2c313c;padding:8px 14px;border-radius:99px;font-size:13px;z-index:7;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -2421,8 +2524,29 @@ button.on{background:var(--accent);border-color:var(--accent)}
   <button data-act="axis">↕ Vänd upp</button>
   <button data-act="bg">🎨 Bakgrund</button>
   <button data-act="info" class="on">ℹ️ Info</button>
+  <button data-act="live">👥 Live</button>
+  <button data-act="point" id="pointBtn" hidden>☝️ Peka</button>
   <button data-act="reset">🎯 Återställ</button>
 </div>
+<div class="live" id="livePanel" hidden>
+  <div class="lhead"><b>👥 Live-granskning</b><button data-live="close" aria-label="Stäng">✕</button></div>
+  <div id="liveJoin">
+    <p>Titta på modellen tillsammans i realtid. Ni ser varandras kamera och laserpekare, och kan följa varandras vinkel.</p>
+    <input id="liveName" maxlength="24" placeholder="Ditt namn" autocomplete="nickname">
+    <button class="primary" data-live="join">Gå med</button>
+  </div>
+  <div id="liveRoom" hidden>
+    <div id="peers"></div>
+    <div class="lbtns">
+      <button data-live="present">📣 Följ mig</button>
+      <button data-live="invite">📋 Kopiera länk</button>
+      <button data-live="leave">Lämna</button>
+    </div>
+  </div>
+</div>
+<div class="banner" id="banner" hidden></div>
+<div class="toast" id="toast" hidden></div>
+
 <div class="overlay" id="ov"><div id="ovmsg">Hämtar modell ...</div><div class="bar"><i id="prog"></i></div></div>
 
 <script type="importmap">
@@ -2537,6 +2661,8 @@ function frame(obj, keepCamera) {
     controls.update();
     controls.saveState();
   }
+  liveScale = maxDim;
+  rescalePeers();
   return { size, maxDim };
 }
 
@@ -2625,6 +2751,7 @@ function showOverlay(msg, isErr) {
 }
 
 async function show(version) {
+  curKey = version.mid + '/' + version.idx;
   showOverlay('Hämtar ' + version.filename + ' ...');
   $('#prog').style.width = '0';
   try {
@@ -2679,10 +2806,430 @@ $('#tools').addEventListener('click', e => {
   }
   else if (act === 'bg') { state.bg = (state.bg + 1) % BGS.length; setBackground(); }
   else if (act === 'info') { state.info = !state.info; setActive('info', state.info); renderInfo(); }
+  else if (act === 'live') { if ($('#livePanel').hidden) openLivePanel(); else $('#livePanel').hidden = true; }
+  else if (act === 'point') { setPointMode(!live.pointMode); }
   else if (act === 'reset') { controls.reset(); }
+  if (['wire', 'uv', 'normals', 'axis'].includes(act)) sendView();
 });
 
-renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+renderer.setAnimationLoop(() => { liveTick(performance.now()); controls.update(); renderer.render(scene, camera); });
+
+// ================= LIVE-GRANSKNING =================
+let VERSIONS = [], curKey = '', liveScale = 1;
+const live = {
+  on: false, es: null, cid: '', name: '', color: '#5865f2',
+  peers: new Map(), presenter: null, followId: null, auto: false,
+  pointMode: false, myPtr: null, myPtrAt: 0, lastCam: 0, lastPtr: 0, dirty: false,
+};
+const peerGroup = new THREE.Group();
+scene.add(peerGroup);
+const raycaster = new THREE.Raycaster();
+const tA = new THREE.Vector3(), tB = new THREE.Vector3();
+const myDot = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 10), new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false }));
+myDot.renderOrder = 999;
+myDot.visible = false;
+scene.add(myDot);
+
+const r3 = a => a.map(v => Math.round(v * 1000) / 1000);
+function rid() {
+  const a = new Uint8Array(9);
+  crypto.getRandomValues(a);
+  return Array.from(a, b => b.toString(36).padStart(2, '0')).join('');
+}
+function toast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { t.hidden = true; }, 2800);
+}
+function send(type, data) {
+  if (!live.on) return;
+  fetch(CFG.liveSend, {
+    method: 'POST', headers: { 'Content-Type': 'text/plain' }, keepalive: true,
+    body: JSON.stringify(Object.assign({ cid: live.cid, type }, data || {})),
+  }).catch(() => {});
+}
+function curView() { return { ver: curKey, wire: state.wire, mode: state.mode, axis: state.axis }; }
+function sendView() { send('view', { v: curView() }); }
+
+function applyView(v) {
+  if (!v) return;
+  state.wire = !!v.wire;
+  state.mode = ['shaded', 'uv', 'normals'].includes(v.mode) ? v.mode : 'shaded';
+  setActive('wire', state.wire);
+  setActive('uv', state.mode === 'uv');
+  setActive('normals', state.mode === 'normals');
+  if (model && state.axis !== !!v.axis) {
+    state.axis = !!v.axis;
+    setActive('axis', state.axis);
+    model.rotation.x = model.userData.baseRotX + (state.axis ? -Math.PI / 2 : 0);
+    model.updateMatrixWorld(true);
+  }
+  applyMode();
+  if (v.ver && v.ver !== curKey) {
+    const i = VERSIONS.findIndex(x => x.mid + '/' + x.idx === v.ver);
+    if (i >= 0) { $('#ver').value = String(i); show(VERSIONS[i]); }
+  }
+}
+
+function rr(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function makeLabel(text, color) {
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 64;
+  const g = c.getContext('2d');
+  rr(g, 4, 6, 248, 52, 26);
+  g.fillStyle = 'rgba(15,17,21,.85)'; g.fill();
+  g.lineWidth = 4; g.strokeStyle = color; g.stroke();
+  g.fillStyle = '#fff'; g.font = 'bold 28px system-ui,sans-serif';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(text.length > 14 ? text.slice(0, 13) + '…' : text, 128, 33);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  sp.scale.set(7.5, 1.9, 1);
+  sp.renderOrder = 1000;
+  return sp;
+}
+
+function ensurePeer(p) {
+  if (p.root) return;
+  const col = new THREE.Color(p.color);
+  const mat = () => new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.92, depthTest: false });
+  p.root = new THREE.Group();
+  p.body = new THREE.Group();
+  const head = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 12), mat());
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.7, 2.4, 16), mat());
+  cone.rotation.x = Math.PI / 2;
+  cone.position.z = 2.0;
+  head.renderOrder = cone.renderOrder = 998;
+  p.body.add(head, cone);
+  p.root.add(p.body);
+  p.label = makeLabel(p.name, p.color);
+  p.label.position.set(0, 2.8, 0);
+  p.root.add(p.label);
+  p.line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+    new THREE.LineBasicMaterial({ color: col, transparent: true, opacity: 0.9, depthTest: false })
+  );
+  p.line.frustumCulled = false;
+  p.line.renderOrder = 997;
+  p.dot = new THREE.Mesh(new THREE.SphereGeometry(1, 12, 10), new THREE.MeshBasicMaterial({ color: col, depthTest: false }));
+  p.dot.renderOrder = 999;
+  p.root.visible = p.line.visible = p.dot.visible = false;
+  peerGroup.add(p.root, p.line, p.dot);
+  p.root.scale.setScalar(liveScale * 0.04);
+  p.dot.scale.setScalar(liveScale * 0.015);
+}
+
+function updatePeer(p) {
+  ensurePeer(p);
+  const hasCam = !!p.cam;
+  const following = live.followId === p.id;
+  p.root.visible = hasCam && !following;
+  if (hasCam) {
+    p.root.position.fromArray(p.cam.p);
+    p.body.lookAt(tA.fromArray(p.cam.t));
+  }
+  if (p.ptr) {
+    p.dot.position.fromArray(p.ptr);
+    p.dot.visible = true;
+    p.ptrAt = performance.now();
+    if (hasCam && !following) {
+      const pos = p.line.geometry.attributes.position;
+      pos.setXYZ(0, p.cam.p[0], p.cam.p[1], p.cam.p[2]);
+      pos.setXYZ(1, p.ptr[0], p.ptr[1], p.ptr[2]);
+      pos.needsUpdate = true;
+      p.line.visible = true;
+    } else {
+      p.line.visible = false;
+    }
+  } else {
+    p.dot.visible = false;
+    p.line.visible = false;
+  }
+}
+
+function disposeObj(o) {
+  o.traverse(n => {
+    if (n.geometry) n.geometry.dispose();
+    if (n.material) { if (n.material.map) n.material.map.dispose(); n.material.dispose(); }
+  });
+}
+function addPeer(raw) {
+  const p = { id: raw.id, name: raw.name, color: raw.color, cam: raw.cam || null, ptr: raw.ptr || null, view: raw.view || null, root: null };
+  live.peers.set(p.id, p);
+  updatePeer(p);
+}
+function removePeer(id) {
+  const p = live.peers.get(id);
+  if (!p) return;
+  [p.root, p.line, p.dot].forEach(o => { if (o) { peerGroup.remove(o); disposeObj(o); } });
+  live.peers.delete(id);
+}
+function rescalePeers() {
+  live.peers.forEach(p => {
+    if (!p.root) return;
+    p.root.scale.setScalar(liveScale * 0.04);
+    p.dot.scale.setScalar(liveScale * 0.015);
+  });
+  myDot.scale.setScalar(liveScale * 0.015);
+}
+
+function updateBanner() {
+  const b = $('#banner');
+  b.textContent = '';
+  if (!live.followId) { b.hidden = true; return; }
+  const p = live.peers.get(live.followId);
+  const span = document.createElement('span');
+  span.textContent = '👁 Följer ' + (p ? p.name : '...');
+  const btn = document.createElement('button');
+  btn.textContent = 'Sluta';
+  btn.dataset.live = 'unfollow';
+  b.append(span, btn);
+  b.hidden = false;
+}
+function renderLive() {
+  const box = $('#peers');
+  box.textContent = '';
+  const row = (name, color, id, isMe) => {
+    const d = document.createElement('div');
+    d.className = 'peer';
+    const i = document.createElement('i');
+    i.style.background = color;
+    const s = document.createElement('span');
+    s.textContent = name + (isMe ? ' (du)' : '') + (live.presenter === id ? ' 📣' : '');
+    d.append(i, s);
+    if (!isMe) {
+      const b = document.createElement('button');
+      b.dataset.follow = id;
+      b.textContent = live.followId === id ? 'Sluta följa' : 'Följ';
+      d.append(b);
+    }
+    box.append(d);
+  };
+  if (live.on) {
+    row(live.name, live.color, live.cid, true);
+    live.peers.forEach(p => row(p.name, p.color, p.id, false));
+  }
+  $('#liveJoin').hidden = live.on;
+  $('#liveRoom').hidden = !live.on;
+  $('#pointBtn').hidden = !live.on;
+  const pb = document.querySelector('[data-live="present"]');
+  const presenting = live.presenter === live.cid;
+  pb.classList.toggle('on', presenting);
+  pb.textContent = presenting ? '📣 Sluta presentera' : '📣 Följ mig';
+  const lb = document.querySelector('[data-act="live"]');
+  lb.classList.toggle('on', live.on);
+  lb.textContent = live.on ? '👥 Live (' + (live.peers.size + 1) + ')' : '👥 Live';
+  updateBanner();
+}
+
+function startFollow(id, auto) {
+  const p = live.peers.get(id);
+  if (!p) return;
+  if (live.pointMode) setPointMode(false);
+  live.followId = id;
+  live.auto = !!auto;
+  if (p.view) applyView(p.view);
+  live.peers.forEach(updatePeer);
+  renderLive();
+  toast('Du följer ' + p.name + ' – dra i vyn för att ta över');
+}
+function stopFollow() {
+  if (!live.followId) return;
+  live.followId = null;
+  live.peers.forEach(updatePeer);
+  renderLive();
+}
+
+function setPointMode(on) {
+  live.pointMode = on;
+  $('#pointBtn').classList.toggle('on', on);
+  controls.enabled = !on;
+  canvas.style.cursor = on ? 'crosshair' : '';
+  if (on) {
+    if (live.followId) stopFollow();
+    toast('Peka med musen eller fingret – de andra ser din laser');
+  } else {
+    live.myPtr = null;
+    myDot.visible = false;
+    send('ptr', { p: null });
+  }
+}
+function onPointer(e) {
+  if (!live.on || !live.pointMode || !model) return;
+  const now = performance.now();
+  if (e.type !== 'pointerdown' && now - live.lastPtr < 66) return;
+  live.lastPtr = now;
+  const r = canvas.getBoundingClientRect();
+  raycaster.setFromCamera({ x: ((e.clientX - r.left) / r.width) * 2 - 1, y: -((e.clientY - r.top) / r.height) * 2 + 1 }, camera);
+  const hit = raycaster.intersectObject(model, true).find(h => h.object.isMesh);
+  if (hit) {
+    live.myPtr = hit.point.toArray();
+    live.myPtrAt = now;
+    myDot.position.copy(hit.point);
+    myDot.material.color.set(live.color);
+    myDot.visible = true;
+    send('ptr', { p: r3(live.myPtr) });
+  } else if (live.myPtr) {
+    live.myPtr = null;
+    myDot.visible = false;
+    send('ptr', { p: null });
+  }
+}
+canvas.addEventListener('pointermove', onPointer);
+canvas.addEventListener('pointerdown', onPointer);
+controls.addEventListener('change', () => { live.dirty = true; });
+controls.addEventListener('start', () => {
+  if (live.followId) { stopFollow(); toast('Du tog över kameran'); }
+});
+
+function liveTick(now) {
+  if (!live.on) return;
+  if (live.followId) {
+    const p = live.peers.get(live.followId);
+    if (p && p.cam) {
+      camera.position.lerp(tA.fromArray(p.cam.p), 0.3);
+      controls.target.lerp(tB.fromArray(p.cam.t), 0.3);
+    }
+  } else if (live.dirty && now - live.lastCam > 90) {
+    live.lastCam = now;
+    live.dirty = false;
+    send('cam', { p: r3(camera.position.toArray()), t: r3(controls.target.toArray()) });
+  }
+  live.peers.forEach(p => {
+    if (p.dot && p.dot.visible && now - p.ptrAt > 15000) { p.ptr = null; updatePeer(p); }
+  });
+  if (live.myPtr && !live.pointMode && now - live.myPtrAt > 15000) { live.myPtr = null; myDot.visible = false; }
+}
+
+function onLive(msg) {
+  switch (msg.type) {
+    case 'hello': {
+      [...live.peers.keys()].forEach(removePeer);
+      live.color = msg.you.color;
+      live.name = msg.you.name;
+      live.on = true;
+      (msg.peers || []).forEach(addPeer);
+      live.presenter = msg.presenter || null;
+      renderLive();
+      toast('Du är med i live-granskningen 🔴');
+      sendView();
+      live.dirty = true;
+      if (live.presenter && live.presenter !== live.cid) startFollow(live.presenter, true);
+      break;
+    }
+    case 'join': addPeer(msg.peer); renderLive(); toast(msg.peer.name + ' gick med'); break;
+    case 'leave': {
+      const p = live.peers.get(msg.id);
+      if (live.followId === msg.id) stopFollow();
+      removePeer(msg.id);
+      renderLive();
+      if (p) toast(p.name + ' lämnade');
+      break;
+    }
+    case 'cam': {
+      const p = live.peers.get(msg.id);
+      if (p) { p.cam = { p: msg.p, t: msg.t }; updatePeer(p); }
+      break;
+    }
+    case 'ptr': {
+      const p = live.peers.get(msg.id);
+      if (p) { p.ptr = msg.p; updatePeer(p); }
+      break;
+    }
+    case 'view': {
+      const p = live.peers.get(msg.id);
+      if (p) p.view = msg.v;
+      if (live.followId === msg.id) applyView(msg.v);
+      break;
+    }
+    case 'present': {
+      live.presenter = msg.id;
+      if (msg.id && msg.id !== live.cid) startFollow(msg.id, true);
+      else if (!msg.id && live.followId && live.auto) stopFollow();
+      renderLive();
+      break;
+    }
+  }
+}
+
+function resetLive() {
+  if (live.es) live.es.close();
+  live.es = null;
+  [...live.peers.keys()].forEach(removePeer);
+  live.on = false;
+  live.followId = null;
+  live.presenter = null;
+  if (live.pointMode) { live.pointMode = false; controls.enabled = true; canvas.style.cursor = ''; $('#pointBtn').classList.remove('on'); }
+  live.myPtr = null;
+  myDot.visible = false;
+  renderLive();
+}
+function joinLive() {
+  if (live.on || live.es) return;
+  let name = $('#liveName').value.replace(/[<>]/g, '').trim().slice(0, 24);
+  if (!name) name = 'Gäst ' + (100 + Math.floor(Math.random() * 900));
+  try { localStorage.setItem('viewer_name', name); } catch (e) {}
+  live.name = name;
+  live.cid = rid();
+  const es = new EventSource(CFG.liveStream + '?cid=' + live.cid + '&name=' + encodeURIComponent(name));
+  live.es = es;
+  es.onmessage = e => { try { onLive(JSON.parse(e.data)); } catch (err) { console.error(err); } };
+  es.onerror = () => {
+    if (es.readyState === 2) {
+      toast(live.on ? 'Anslutningen bröts' : 'Kunde inte gå med (rummet kan vara fullt)');
+      resetLive();
+    } else if (live.on) {
+      toast('Återansluter ...');
+    }
+  };
+}
+async function copyInvite() {
+  const u = location.origin + location.pathname + '?live=1';
+  try { await navigator.clipboard.writeText(u); toast('Länk kopierad – skicka den till din kompis'); }
+  catch (e) { window.prompt('Kopiera länken:', u); }
+}
+function openLivePanel() {
+  const panel = $('#livePanel');
+  panel.hidden = false;
+  if (!$('#liveName').value) { try { $('#liveName').value = localStorage.getItem('viewer_name') || ''; } catch (e) {} }
+}
+function autoLive() {
+  openLivePanel();
+  if ($('#liveName').value) joinLive(); else $('#liveName').focus();
+}
+
+document.addEventListener('click', e => {
+  const f = e.target.closest('[data-follow]');
+  if (f) { const id = f.dataset.follow; if (live.followId === id) stopFollow(); else startFollow(id, false); return; }
+  const b = e.target.closest('[data-live]');
+  if (!b) return;
+  const act = b.dataset.live;
+  if (act === 'close') $('#livePanel').hidden = true;
+  else if (act === 'join') joinLive();
+  else if (act === 'leave') { send('bye'); resetLive(); }
+  else if (act === 'invite') copyInvite();
+  else if (act === 'unfollow') stopFollow();
+  else if (act === 'present') {
+    if (live.presenter === live.cid) send('present', { on: false });
+    else {
+      stopFollow();
+      sendView();
+      send('cam', { p: r3(camera.position.toArray()), t: r3(controls.target.toArray()) });
+      send('present', { on: true });
+    }
+  }
+});
+$('#liveName').addEventListener('keydown', e => { if (e.key === 'Enter') joinLive(); });
+window.addEventListener('pagehide', () => {
+  if (live.on) navigator.sendBeacon(CFG.liveSend, JSON.stringify({ cid: live.cid, type: 'bye' }));
+});
 
 (async () => {
   try {
@@ -2695,6 +3242,7 @@ renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, came
     if (meta.status) { $('#status').textContent = meta.status; $('#status').hidden = false; }
     if (meta.discord_url) { $('#back').href = meta.discord_url; $('#back').hidden = false; }
     const versions = meta.versions || [];
+    VERSIONS = versions;
     if (!versions.length) { showOverlay('Hittade ingen 3D-fil i den här tråden (stöds: glb, gltf, obj, stl, fbx).', true); return; }
     const sel = $('#ver');
     versions.forEach((v, i) => {
@@ -2707,8 +3255,9 @@ renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, came
     let start = 0;
     if (CFG.m) { const i = versions.findIndex(v => v.mid === CFG.m); if (i >= 0) start = i; }
     sel.value = String(start);
-    sel.addEventListener('change', () => show(versions[Number(sel.value)]));
+    sel.addEventListener('change', () => { show(versions[Number(sel.value)]).then(sendView); });
     await show(versions[start]);
+    if (CFG.live) autoLive();
   } catch (e) {
     console.error(e);
     showOverlay('Kunde inte öppna 3D-vyn: ' + (e && e.message ? e.message : e), true);
@@ -2758,6 +3307,11 @@ def viewer_url(thread_id: int, message_id: int | None = None) -> str | None:
     if message_id:
         url += f"?m={message_id}"
     return url
+
+
+def live_link(url: str) -> str:
+    """Samma 3D-länk men med live-läget på (frågar efter namn och går med direkt)."""
+    return url + ("&" if "?" in url else "?") + "live=1"
 
 
 def make_viewer_view(url: str) -> discord.ui.View:
@@ -2857,6 +3411,188 @@ def run_on_bot(coro, timeout: float = 45):
     return asyncio.run_coroutine_threadsafe(coro, bot.loop).result(timeout=timeout)
 
 
+# ---- Live-granskning: flera personer i samma 3D-vy (realtid via Server-Sent Events) ---- #
+LIVE_COLORS = ["#ff5f5f", "#4fa3ff", "#43d17a", "#ffc94d", "#c084fc", "#ff8ad8", "#2dd4bf", "#fb923c"]
+LIVE_MAX_CLIENTS = 8
+LIVE_NOTIFY_PING = "@everyone"  # Pingas i tråden när någon startar en live-granskning ("" = ingen ping)
+LIVE_NOTIFY_COOLDOWN = 600  # Sekunder mellan två notiser för samma tråd
+
+
+class LiveClient:
+    def __init__(self, cid: str, name: str, color: str) -> None:
+        self.cid = cid
+        self.name = name
+        self.color = color
+        self.q: "queue.Queue" = queue.Queue(maxsize=300)
+        self.cam: dict | None = None
+        self.ptr: list | None = None
+        self.view: dict | None = None
+
+
+class LiveRoom:
+    def __init__(self) -> None:
+        self.clients: dict[str, LiveClient] = {}
+        self.presenter: str | None = None
+
+
+LIVE_ROOMS: dict[int, LiveRoom] = {}
+LIVE_LAST_NOTIFY: dict[int, float] = {}
+LIVE_LOCK = threading.RLock()
+
+
+def live_clean_name(raw: str) -> str:
+    name = re.sub(r"[\x00-\x1f\x7f<>@`*_~|]", "", raw or "").strip()[:24]
+    return name or f"Gäst {random.randint(100, 999)}"
+
+
+def live_clean_vec(v) -> list | None:
+    if not isinstance(v, (list, tuple)) or len(v) != 3:
+        return None
+    out = []
+    for x in v:
+        if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or abs(x) > 1e6:
+            return None
+        out.append(round(float(x), 4))
+    return out
+
+
+def live_clean_view(v) -> dict | None:
+    if not isinstance(v, dict):
+        return None
+    ver = str(v.get("ver", ""))
+    if ver and not re.fullmatch(r"\d{1,20}/\d{1,2}", ver):
+        ver = ""
+    mode = v.get("mode") if v.get("mode") in ("shaded", "uv", "normals") else "shaded"
+    return {"ver": ver, "wire": bool(v.get("wire")), "mode": mode, "axis": bool(v.get("axis"))}
+
+
+def live_peer(c: LiveClient) -> dict:
+    return {"id": c.cid, "name": c.name, "color": c.color, "cam": c.cam, "ptr": c.ptr, "view": c.view}
+
+
+def live_broadcast(room: LiveRoom, msg: dict, exclude: str | None = None) -> None:
+    """Skickar till alla i rummet (anropas med LIVE_LOCK låst)."""
+    for c in room.clients.values():
+        if c.cid == exclude:
+            continue
+        try:
+            c.q.put_nowait(msg)
+        except queue.Full:
+            try:
+                c.q.get_nowait()  # Släng äldsta – hellre aktuell än komplett
+                c.q.put_nowait(msg)
+            except (queue.Empty, queue.Full):
+                pass
+
+
+def live_join(thread_id: int, cid: str, raw_name: str) -> tuple[LiveClient, dict]:
+    name = live_clean_name(raw_name)
+    with LIVE_LOCK:
+        room = LIVE_ROOMS.setdefault(thread_id, LiveRoom())
+        old = room.clients.get(cid)
+        if old is None and len(room.clients) >= LIVE_MAX_CLIENTS:
+            raise WebError(429, "Rummet är fullt.")
+        if old is not None:
+            old.q.put(None)  # Avsluta den gamla anslutningen (t.ex. vid återanslutning)
+        used = {c.color for c in room.clients.values() if c.cid != cid}
+        color = next((col for col in LIVE_COLORS if col not in used), LIVE_COLORS[len(room.clients) % len(LIVE_COLORS)])
+        client = LiveClient(cid, name, color)
+        if old is not None:
+            client.cam, client.ptr, client.view = old.cam, old.ptr, old.view
+        first = not room.clients
+        room.clients[cid] = client
+        live_broadcast(room, {"type": "join", "peer": live_peer(client)}, exclude=cid)
+        hello = {
+            "type": "hello",
+            "you": {"id": cid, "name": name, "color": color},
+            "peers": [live_peer(c) for c in room.clients.values() if c.cid != cid],
+            "presenter": room.presenter,
+        }
+        notify = first and old is None and (time.time() - LIVE_LAST_NOTIFY.get(thread_id, 0) > LIVE_NOTIFY_COOLDOWN)
+        if notify:
+            LIVE_LAST_NOTIFY[thread_id] = time.time()
+    if notify:
+        notify_live_started(thread_id, name)
+    return client, hello
+
+
+def live_leave(thread_id: int, client: LiveClient) -> None:
+    with LIVE_LOCK:
+        room = LIVE_ROOMS.get(thread_id)
+        if room is None or room.clients.get(client.cid) is not client:
+            return  # Ersatt av en nyare anslutning
+        del room.clients[client.cid]
+        live_broadcast(room, {"type": "leave", "id": client.cid})
+        if room.presenter == client.cid:
+            room.presenter = None
+            live_broadcast(room, {"type": "present", "id": None})
+        if not room.clients:
+            LIVE_ROOMS.pop(thread_id, None)
+
+
+def live_message(thread_id: int, data) -> None:
+    if not isinstance(data, dict):
+        raise WebError(400, "Ogiltigt meddelande.")
+    cid = str(data.get("cid", ""))
+    kind = data.get("type")
+    with LIVE_LOCK:
+        room = LIVE_ROOMS.get(thread_id)
+        client = room.clients.get(cid) if room else None
+        if room is None or client is None:
+            raise WebError(410, "Du är inte ansluten.")
+        if kind == "cam":
+            p, t = live_clean_vec(data.get("p")), live_clean_vec(data.get("t"))
+            if p and t:
+                client.cam = {"p": p, "t": t}
+                live_broadcast(room, {"type": "cam", "id": cid, "p": p, "t": t}, exclude=cid)
+        elif kind == "ptr":
+            p = live_clean_vec(data.get("p"))
+            client.ptr = p
+            live_broadcast(room, {"type": "ptr", "id": cid, "p": p}, exclude=cid)
+        elif kind == "view":
+            v = live_clean_view(data.get("v"))
+            if v:
+                client.view = v
+                live_broadcast(room, {"type": "view", "id": cid, "v": v}, exclude=cid)
+        elif kind == "present":
+            if data.get("on"):
+                room.presenter = cid
+            elif room.presenter == cid:
+                room.presenter = None
+            live_broadcast(room, {"type": "present", "id": room.presenter})
+        elif kind == "bye":
+            client.q.put(None)  # Strömmen avslutas och live_leave körs
+        else:
+            raise WebError(400, "Okänd typ.")
+
+
+def notify_live_started(thread_id: int, name: str) -> None:
+    bot = WEB_BOT
+    if bot is None or not bot.is_ready():
+        return
+    asyncio.run_coroutine_threadsafe(_notify_live(bot, thread_id, name), bot.loop)
+
+
+async def _notify_live(bot: "FileBot", thread_id: int, name: str) -> None:
+    try:
+        thread = await viewer_thread(bot, thread_id)
+        url = viewer_url(thread_id)
+        if not url:
+            return
+        link = live_link(url)
+        view = discord.ui.View(timeout=None)
+        view.add_item(discord.ui.Button(label="Hoppa in", emoji="🔴", style=discord.ButtonStyle.link, url=link))
+        safe_name = discord.utils.escape_mentions(discord.utils.escape_markdown(name))
+        ping = f"{LIVE_NOTIFY_PING} " if LIVE_NOTIFY_PING else ""
+        await thread.send(
+            f"{ping}🔴 **{safe_name}** har startat en **live-granskning** av den här modellen – hoppa in och titta tillsammans!",
+            view=view,
+            allowed_mentions=discord.AllowedMentions(everyone=bool(LIVE_NOTIFY_PING), users=False, roles=False),
+        )
+    except Exception:
+        log.exception("Kunde inte skicka live-notis")
+
+
 class WebHandler(BaseHTTPRequestHandler):
     server_version = "FileBot"
 
@@ -2892,6 +3628,9 @@ class WebHandler(BaseHTTPRequestHandler):
                     "api": f"/api/{m[1]}/{m[2]}",
                     "file": f"/file/{m[1]}/{m[2]}/",
                     "m": focus if focus.isdigit() else None,
+                    "live": query.get("live", [""])[0] == "1",
+                    "liveStream": f"/live/{m[1]}/{m[2]}/stream",
+                    "liveSend": f"/live/{m[1]}/{m[2]}/send",
                 }
                 html = VIEWER_HTML.replace("__CFG__", json.dumps(cfg))
                 self._send(200, html.encode("utf-8"), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
@@ -2911,6 +3650,12 @@ class WebHandler(BaseHTTPRequestHandler):
                 self._send(200, data, "application/octet-stream", {"Cache-Control": "private, max-age=600"})
                 return
 
+            m = re.fullmatch(r"/live/(\d{1,20})/([0-9a-f]{32})/stream", path)
+            if m:
+                self._check_sig(m)
+                self._live_stream(int(m[1]), parse_qs(parsed.query))
+                return
+
             self._send(404, b"Not found")
         except WebError as exc:
             self._send(exc.code, exc.message.encode("utf-8"))
@@ -2921,6 +3666,71 @@ class WebHandler(BaseHTTPRequestHandler):
         except Exception:
             log.exception("Fel i webbservern för %s", self.path)
             self._send(500, b"Internal error")
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            m = re.fullmatch(r"/live/(\d{1,20})/([0-9a-f]{32})/send", parsed.path)
+            if not m:
+                self._send(404, b"Not found")
+                return
+            self._check_sig(m)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length <= 0 or length > 4096:
+                raise WebError(413, "Ogiltig storlek.")
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                raise WebError(400, "Ogiltig JSON.")
+            live_message(int(m[1]), data)
+            self._send(200, b"ok")
+        except WebError as exc:
+            self._send(exc.code, exc.message.encode("utf-8"))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            log.exception("Fel i live-meddelande")
+            self._send(500, b"Internal error")
+
+    def _sse(self, msg: dict) -> None:
+        self.wfile.write(b"data: " + json.dumps(msg, separators=(",", ":")).encode("utf-8") + b"\n\n")
+        self.wfile.flush()
+
+    def _live_stream(self, thread_id: int, query: dict) -> None:
+        if self.command == "HEAD":
+            raise WebError(405, "Använd GET.")
+        cid = query.get("cid", [""])[0]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,40}", cid):
+            raise WebError(400, "Ogiltigt id.")
+        client, hello = live_join(thread_id, cid, query.get("name", [""])[0])
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            self.wfile.write(b"retry: 2000\n\n")
+            self._sse(hello)
+            while True:
+                try:
+                    msg = client.q.get(timeout=15)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")  # Håller anslutningen vid liv
+                    self.wfile.flush()
+                    continue
+                if msg is None:
+                    break
+                self._sse(msg)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            live_leave(thread_id, client)
 
     @staticmethod
     def _check_sig(m: "re.Match") -> None:
